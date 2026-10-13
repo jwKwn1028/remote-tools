@@ -664,7 +664,7 @@ class StorageTests(unittest.TestCase):
         # Once the job has left the queue, a missing completion record is worth stating.
         self.assertIn("Completion: unavailable", jobmon.format_report(self.report_for(run)))
 
-    def watch(self, sleep, count, clock, snapshot_tick=65):
+    def watch(self, sleep, count, clock, snapshot_tick=65, **options):
         # Slurm reports 1:00 elapsed at the snapshot, so the job started at tick 5.
         snapshot = dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc) + dt.timedelta(seconds=snapshot_tick)
 
@@ -686,7 +686,7 @@ class StorageTests(unittest.TestCase):
                 patch.object(jobmon.time, "time", lambda: clock[0]), \
                 patch.object(jobmon, "utc_now", lambda: snapshot.isoformat()), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
-            jobmon.execute("watch", "123_7", interval=5, count=count, utc_offset_minutes=0)
+            jobmon.execute("watch", "123_7", interval=5, count=count, utc_offset_minutes=0, **options)
         return output.getvalue(), sleeps
 
     def test_text_watch_states_context_once_and_prints_rows_only_for_new_samples(self):
@@ -727,8 +727,153 @@ class StorageTests(unittest.TestCase):
             "workload_exit_code": 0, "scope": "batch wrapper"})
         text, _ = self.watch(lambda calls: None, 6, [base + 600])
         self.assertNotIn("no new sample", text)
-        self.assertEqual(text.count("workload exit 0 (batch wrapper)"), 1)
+        self.assertEqual(text.count("Workload finished successfully (exit code 0)."), 1)
         self.assertTrue([line for line in text.splitlines() if line.startswith("00:01:00")][0].endswith("  final"))
+
+    def test_watch_completion_names_nonzero_exit_and_summarizes_sampled_usage_once(self):
+        base = dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc).timestamp()
+        self.append(self.record(tick=0, memory=4096))
+        self.append(self.record(tick=30, memory=100, cpu_delta=30, final=True))
+        collect.finish(self.run, 1)
+        text, sleeps = self.watch(lambda calls: None, 4, [base + 35])
+        self.assertEqual(len(sleeps), 3)  # Default watches keep following later runs.
+        for once in ("Workload finished with exit code 1 (nonzero).", "Final samples: 1/1 node recorded.",
+                     "CPU average (sampled intervals): 12.5% of allocated cores",
+                     "Sampled memory peak: 4.00 KiB", "Check application logs; run hpc-jreport 123_7",
+                     "Watch remains open; press Ctrl-C to stop viewing."):
+            self.assertEqual(text.count(once), 1, once)
+        self.assertNotIn("all expected collectors final:", text)
+        self.assertNotIn("Watch finished for", text)
+
+    def test_watch_completion_keeps_unavailable_usage_unavailable(self):
+        base = dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc).timestamp()
+        self.append(self.record(memory=None, final=True))
+        collect.finish(self.run, 0)
+        text, _ = self.watch(lambda calls: None, 1, [base + 5])
+        self.assertIn("CPU average (sampled intervals): unavailable", text)
+        self.assertIn("Sampled memory peak: unavailable", text)
+        self.assertNotIn("unavailable of allocated cores", text)
+        self.assertNotIn("0.0%", text)
+
+    def test_watch_updates_final_node_counts_and_exits_after_delayed_samples(self):
+        base = dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc).timestamp()
+        self.metadata.update(expected_nodes=["node1", "node2"], expected_node_count=2,
+                             allocated_cpus_by_node={"node1": 8, "node2": 8})
+        (self.run / "metadata.json").write_text(json.dumps(self.metadata))
+        self.append(self.record(tick=0))
+        self.append(self.record(tick=30, cpu_delta=30, final=True))
+        self.append(self.record(node="node2", tick=0, memory=200), "node2")
+        collect.finish(self.run, 0)
+
+        def append_final(calls):
+            if calls == 1:
+                self.append(self.record(node="node2", tick=30, memory=100, cpu_delta=60, final=True), "node2")
+
+        text, sleeps = self.watch(append_final, 4, [base + 35], exit_on_completion=True)
+        self.assertEqual(len(sleeps), 1)
+        for once in ("Workload finished successfully (exit code 0).",
+                     "Final samples: 1/2 nodes; waiting for final samples.",
+                     "Final samples: 2/2 nodes recorded.",
+                     "CPU average (sampled intervals): 18.8% of allocated cores",
+                     "Sampled memory peak on node1: 100 B", "Sampled memory peak on node2: 200 B",
+                     "Watch finished for the latest saved run."):
+            self.assertEqual(text.count(once), 1, once)
+        self.assertNotIn("Watch remains open", text)
+
+    def test_exit_on_completion_waits_for_wrapper_exit_and_final_samples(self):
+        base = dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc).timestamp()
+        self.append(self.record(tick=0))
+        collect.finish(self.run, 0)
+        text, sleeps = self.watch(lambda calls: None, 3, [base + 5], exit_on_completion=True)
+        self.assertEqual(len(sleeps), 2)
+        self.assertIn("Final samples: 0/1 node; waiting for final samples.", text)
+        self.assertNotIn("Watch finished for", text)
+        (self.run / "completion.json").unlink()
+        self.append(self.record(tick=30, cpu_delta=30, final=True))
+        text, sleeps = self.watch(lambda calls: None, 3, [base + 35], exit_on_completion=True)
+        self.assertEqual(len(sleeps), 2)
+        self.assertNotIn("Watch finished for", text)
+        collect.finish(self.run, 0)
+        text, sleeps = self.watch(lambda calls: None, 3, [base + 35], exit_on_completion=True)
+        self.assertEqual(sleeps, [])
+        self.assertIn("Watch finished for the latest saved run.", text)
+
+    def test_exit_on_completion_requires_verified_node_layout(self):
+        base = dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc).timestamp()
+        self.append(self.record(final=True))
+        collect.finish(self.run, 0)
+        self.metadata["expected_nodes"] = []
+        for total in (1, None):
+            with self.subTest(total=total):
+                self.metadata["expected_node_count"] = total
+                (self.run / "metadata.json").write_text(json.dumps(self.metadata))
+                text, sleeps = self.watch(lambda calls: None, 3, [base + 5], exit_on_completion=True)
+                self.assertEqual(len(sleeps), 2)
+                counts = "1/1 node" if total == 1 else "1/unknown nodes"
+                self.assertIn("Final samples: " + counts + "; expected node layout incomplete.", text)
+                self.assertNotIn("Watch finished for", text)
+
+    def test_exit_on_completion_follows_newest_run_instead_of_an_older_completed_run(self):
+        base = dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc)
+        self.metadata["created_at"] = base.isoformat()
+        (self.run / "metadata.json").write_text(json.dumps(self.metadata))
+        self.append(self.record(final=True))
+        collect.finish(self.run, 0)
+        with patch.object(collect, "utc_now", return_value=(base + dt.timedelta(seconds=60)).isoformat()):
+            new_run = collect.initialize(runner=lambda argv: "node1\n")
+        record = self.record(tick=60)
+        record["run_id"] = new_run.name
+        collect.write_json(new_run / "node1--test.jsonl", record)
+
+        def finish_new_run(calls):
+            if calls == 1:
+                record = self.record(tick=90, cpu_delta=30, final=True)
+                record["run_id"] = new_run.name
+                with collect.private_open(new_run / "node1--test.jsonl", os.O_WRONLY | os.O_APPEND, "a") as stream:
+                    stream.write(json.dumps(record) + "\n")
+                collect.finish(new_run, 1)
+
+        build_report = jobmon.build_report
+
+        def newest_first(*args, **kwargs):
+            report, history = build_report(*args, **kwargs)
+            # Put the old completed run last: iteration order cannot choose the target.
+            report["runs"].sort(key=lambda run: run["metadata"]["created_at"], reverse=True)
+            return report, history
+
+        with patch.object(jobmon, "build_report", newest_first):
+            text, sleeps = self.watch(finish_new_run, 4, [base.timestamp() + 65], exit_on_completion=True)
+        self.assertEqual(len(sleeps), 1)
+        self.assertIn("run " + new_run.name + ": Workload finished with exit code 1 (nonzero).", text)
+        self.assertIn("Watch finished for the latest saved run.", text)
+
+    def test_json_watch_exits_after_final_samples_without_changing_report_format(self):
+        base = dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc).timestamp()
+        self.append(self.record(tick=0))
+        collect.finish(self.run, 1)
+        text, sleeps = self.watch(
+            lambda calls: calls == 1 and self.append(self.record(tick=30, cpu_delta=30, final=True)),
+            4, [base + 5], exit_on_completion=True, as_json=True)
+        self.assertEqual(len(sleeps), 1)
+        snapshots = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual(len(snapshots), 2)
+        self.assertFalse(snapshots[0]["runs"][0]["all_expected_collectors_final"])
+        self.assertTrue(snapshots[1]["runs"][0]["all_expected_collectors_final"])
+        self.assertEqual(snapshots[1]["runs"][0]["completion"]["workload_exit_code"], 1)
+        self.assertNotIn("exit_on_completion", snapshots[1])
+
+    def test_cli_exit_on_completion_keeps_viewer_status_separate_from_workload_status(self):
+        self.append(self.record(final=True))
+        collect.finish(self.run, 1)
+        scheduler = {"ownership_verified": False, "queue": [], "accounting": [], "live_steps": [], "errors": []}
+        with patch.object(SlurmBackend, "snapshot", return_value=scheduler) as snapshot, \
+                patch.object(jobmon.time, "sleep") as sleep, contextlib.redirect_stdout(io.StringIO()) as output:
+            result = jobmon.main(["watch", "123_7", "--json", "--exit-on-completion"])
+        self.assertEqual(result, 0)
+        self.assertEqual(snapshot.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertTrue(json.loads(output.getvalue())["runs"][0]["all_expected_collectors_final"])
 
     def test_watch_maxima_hold_after_cpu_and_memory_drop(self):
         base = dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc).timestamp()
@@ -1108,6 +1253,10 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(watch["utc_offset_minutes"], -330)
         storage = jobmon.transport_request(io.StringIO('{"operation":"storage-init","json":true}'))
         self.assertEqual(storage, {"operation": "storage-init", "as_json": True})
+        for enabled in (True, False):
+            watch = jobmon.transport_request(io.StringIO(json.dumps({
+                "operation": "watch", "job_id": "123_7", "exit_on_completion": enabled})))
+            self.assertIs(watch["exit_on_completion"], enabled)
         for value in ({"operation": "shell"}, {"operation": "show", "job_id": "1; id"},
                       {"operation": "doctor", "command": "id"}, {"operation": "watch", "job_id": "1", "interval": True},
                       {"operation": "watch", "job_id": "1", "interval": 0},
@@ -1117,7 +1266,12 @@ class TransportTests(unittest.TestCase):
                       {"operation": "watch", "job_id": "1", "utc_offset_minutes": 1440},
                       {"operation": "watch", "job_id": "1", "utc_offset_minutes": True},
                       {"operation": "watch", "job_id": "1", "utc_offset_minutes": "+0900"},
-                      {"operation": "report", "job_id": "1", "utc_offset_minutes": 540}):
+                      {"operation": "report", "job_id": "1", "utc_offset_minutes": 540},
+                      {"operation": "watch", "job_id": "1", "exit_on_completion": "true"},
+                      {"operation": "watch", "job_id": "1", "exit_on_completion": 1},
+                      {"operation": "watch", "job_id": "1", "exit_on_completion": None},
+                      {"operation": "report", "job_id": "1", "exit_on_completion": True},
+                      {"operation": "jobs", "exit_on_completion": False}):
             with self.subTest(value=value), self.assertRaises(JobmonError):
                 jobmon.transport_request(io.StringIO(json.dumps(value)))
 
@@ -1182,6 +1336,30 @@ class TransportTests(unittest.TestCase):
 
     def last_request(self, capture):
         return json.loads(self.last_call(capture)["stdin"])
+
+    def test_exit_on_completion_is_sent_as_json_and_rejected_for_other_operations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env, capture = self.zsh_environment(Path(directory))
+            env["HPC_JOBMON_HOST"] = "test-alias"
+            helpers = str(ROOT / "shell/jobmon.zsh")
+            result = subprocess.run([
+                "zsh", "-f", "-c", 'source "$1"; hpc-jwatch 123_7 --exit-on-completion --json --count 2',
+                "test", helpers], env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            request = self.last_request(capture)
+            self.assertIs(request["exit_on_completion"], True)
+            self.assertIs(request["json"], True)
+            self.assertEqual(request["count"], 2)
+            self.assertNotIn("exit_on_completion", self.last_call(capture)["args"][-1])
+            calls = capture.read_text()
+            for command in ("hpc-jreport 123_7", "hpc-job 123_7", "hpc-jobs", "hpc-jdoctor", "hpc-jstorage-init"):
+                with self.subTest(command=command):
+                    result = subprocess.run([
+                        "zsh", "-f", "-c", 'source "$1"; ' + command + " --exit-on-completion", "test", helpers],
+                        env=env, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("not valid for", result.stderr)
+                    self.assertEqual(capture.read_text(), calls)
 
     def test_ssh_destination_may_be_user_at_host_but_never_options(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1272,12 +1450,18 @@ class TransportTests(unittest.TestCase):
                        JOBS_TABLE=table, HPC_JOBMON_HOST="test-alias", TERM="xterm", COLUMNS="100",
                        LINES=str(lines))
             pid, fd = pty.fork()
-            if pid == 0:  # pragma: no cover - replaced by zsh immediately
-                # Report the terminal's signal-key and echo settings afterwards: the menu must restore both.
-                script = ('source "$1"; shift; hpc-jwatch "$@"; rc=$?; '
-                          'print -r -- "terminal:" $(stty -a </dev/tty | tr " " "\\n" | grep -xE -- "-?(isig|echo)"); '
-                          'exit $rc')
-                os.execvpe("zsh", ["zsh", "-f", "-c", script, "test", str(ROOT / "shell/jobmon.zsh"), *args], env)
+            if pid == 0:
+                try:
+                    # Report terminal settings afterwards: the menu must restore signal keys and echo.
+                    script = ('source "$1"; shift; hpc-jwatch "$@"; rc=$?; '
+                              'print -r -- "terminal:" $(stty -a </dev/tty | tr " " "\\n" '
+                              '| grep -xE -- "-?(isig|echo)"); exit $rc')
+                    os.execvpe("zsh", ["zsh", "-f", "-c", script, "test", str(ROOT / "shell/jobmon.zsh"), *args], env)
+                except OSError as exc:
+                    os.write(2, ("Cannot start test shell zsh: {}\n".format(exc)).encode("utf-8", errors="replace"))
+                finally:
+                    # An exec failure must never return this child to the unittest runner.
+                    os._exit(127)
             output, deadline, pending = b"", time.time() + 10, list(keys)
             try:
                 while time.time() < deadline:
@@ -1308,6 +1492,14 @@ class TransportTests(unittest.TestCase):
                 os.close(fd)
             requests = [json.loads(line) for line in capture.read_text().splitlines()] if capture.exists() else []
             return output.decode(errors="replace"), os.WEXITSTATUS(status), requests
+
+    def test_jwatch_picker_child_exits_when_shell_start_fails(self):
+        with patch.object(os, "execvpe", side_effect=FileNotFoundError("synthetic missing shell")):
+            screen, status, requests = self.pick(self.job_table(("900_0", "RUNNING")))
+        self.assertEqual(status, 127, screen)
+        self.assertIn("Cannot start test shell zsh: synthetic missing shell", screen)
+        self.assertNotIn("Traceback", screen)
+        self.assertEqual(requests, [])
 
     def test_jwatch_without_an_id_picks_a_running_job_with_keys(self):
         table = self.job_table(("900_2", "PENDING"), ("900_0", "RUNNING"), ("900_1", "RUNNING"),

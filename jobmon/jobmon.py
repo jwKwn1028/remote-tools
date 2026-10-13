@@ -706,23 +706,39 @@ class WatchLayout:
             display_bytes(state["memory_peak_bytes"], "-")), "  final" if state["final"] else "")
 
 
+def watch_complete(report):
+    """The newest saved run has a wrapper exit and verified final samples."""
+    if not report["runs"]:
+        return False
+    newest = max(report["runs"], key=lambda run: (
+        timestamp_seconds(run["metadata"].get("created_at")) or 0, run["run_id"]))
+    return bool(newest["completion"] and newest["all_expected_collectors_final"])
+
+
 class WatchView:
     """Text watch: state fixed context once, then a row only when a sample arrives."""
 
-    def __init__(self, tz=None):
+    def __init__(self, tz=None, exit_on_completion=False):
         self.tz = tz
+        self.exit_on_completion = exit_on_completion
         self.started = False
         self.runs = {}
         self.shown = {}
         self.stale = set()
         self.errors = set()
         self.completed = set()
+        self.completion_progress = {}
+        self.summarized = set()
+        self.open_hint_shown = False
 
     def update(self, report):
         lines = []
         if not self.started:
             self.started = True
             lines.extend(watch_header(report, self.tz))
+            if self.exit_on_completion:
+                lines.append("This watch stops after the newest saved run has finished and all expected "
+                             "final samples are recorded.")
             self.errors.update(report["scheduler"]["errors"] + report["errors"])
         now = time.time()
         stamp = clock_time(now, self.tz)
@@ -751,14 +767,59 @@ class WatchView:
                 if error not in self.errors:
                     self.errors.add(error)
                     lines.append("{}  collection: {}".format(stamp, error))
-            if run["completion"] and run_id not in self.completed:
-                self.completed.add(run_id)
-                lines.append("{}  workload exit {} (batch wrapper); all expected collectors final: {}".format(
-                    stamp, run["completion"]["workload_exit_code"], run["all_expected_collectors_final"]))
+            if run["completion"]:
+                lines.extend(self.completion_lines(report, run, stamp))
         for error in report["errors"]:
             if error not in self.errors:
                 self.errors.add(error)
                 lines.append("{}  diagnostic: {}".format(stamp, error))
+        return lines
+
+    def completion_lines(self, report, run, stamp):
+        run_id = run["run_id"]
+        prefix = stamp + "  " + ("run " + run_id + ": " if len(report["runs"]) > 1 else "")
+        lines = []
+        first = run_id not in self.completed
+        if first:
+            self.completed.add(run_id)
+            code = run["completion"]["workload_exit_code"]
+            outcome = ("Workload finished successfully (exit code 0)." if code == 0 else
+                       "Workload finished with exit code {} (nonzero).".format(code))
+            lines.append(prefix + outcome)
+
+        final = sum(state["final"] for state in run["nodes"].values())
+        total = run["metadata"].get("expected_node_count") or len(run["expected_nodes"]) or None
+        layout_known = bool(run["expected_nodes"]) and total == len(run["expected_nodes"])
+        complete = run["all_expected_collectors_final"]
+        progress = (final, total, layout_known, complete)
+        if self.completion_progress.get(run_id) != progress:
+            self.completion_progress[run_id] = progress
+            counts = "{}/{} {}".format(final, total if total is not None else "unknown",
+                                      "node" if total == 1 else "nodes")
+            if complete:
+                status = " recorded."
+            elif not layout_known:
+                status = "; expected node layout incomplete."
+            else:
+                status = "; waiting for final samples."
+            lines.append(prefix + "Final samples: " + counts + status)
+
+        if complete and run_id not in self.summarized:
+            self.summarized.add(run_id)
+            percent = run["cpu_percent_covered_intervals"]
+            lines.append("          CPU average (sampled intervals): {}{}".format(
+                display_cpu(percent, None), " of allocated cores" if percent is not None else ""))
+            for node, state in sorted(run["nodes"].items()):
+                label = "Sampled memory peak" + (" on " + node if multi_node(run) else "")
+                lines.append("          {}: {}".format(label, display_bytes(state["memory_peak_bytes"])))
+
+        if first:
+            guidance = "Check application logs; run" if run["completion"]["workload_exit_code"] else "Run"
+            lines.append("          {} hpc-jreport {} for final Slurm status.".format(
+                guidance, report["job_id"]))
+            if not self.exit_on_completion and not self.open_hint_shown:
+                self.open_hint_shown = True
+                lines.append("          Watch remains open; press Ctrl-C to stop viewing.")
         return lines
 
 
@@ -796,7 +857,8 @@ def export_history(job_id):
                     archive.addfile(info, stream.buffer)
 
 
-def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=30, utc_offset_minutes=None):
+def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=30,
+            utc_offset_minutes=None, exit_on_completion=False):
     if operation == "storage-init":
         emit({"schema_version": SCHEMA_VERSION,
               "storage_probe": initialize_storage_probe()}, as_json)
@@ -861,7 +923,7 @@ def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=
         raise JobmonError("No collector history to watch. Use show/report for an on-demand scheduler snapshot.")
     # The workstation helper sends its UTC offset; direct use keeps this host's zone.
     zone = None if utc_offset_minutes is None else dt.timezone(dt.timedelta(minutes=utc_offset_minutes))
-    view = None if as_json else WatchView(zone)
+    view = None if as_json else WatchView(zone, exit_on_completion)
     displayed = 0
     while True:
         if view is None:
@@ -870,6 +932,11 @@ def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=
             lines = view.update(report)
             if lines:
                 print("\n".join(lines), flush=True)
+        if exit_on_completion and watch_complete(report):
+            if view is not None:
+                print("{}  Watch finished for the latest saved run.".format(
+                    clock_time(time.time(), zone)), flush=True)
+            return
         # --count bounds refreshes, not new samples, so it ends even if collection stops.
         displayed += 1
         if count is not None and displayed >= count:
@@ -896,7 +963,8 @@ def transport_request(stream):
         "storage-init": {"operation", "json"},
         "jobs": {"operation", "json"},
         "show": {"operation", "job_id", "json", "days"},
-        "watch": {"operation", "job_id", "json", "days", "interval", "count", "utc_offset_minutes"},
+        "watch": {"operation", "job_id", "json", "days", "interval", "count", "utc_offset_minutes",
+                  "exit_on_completion"},
         "report": {"operation", "job_id", "json", "days"},
         "fetch": {"operation", "job_id"},
     }
@@ -907,8 +975,9 @@ def transport_request(stream):
         raise JobmonError("Unsupported fields for {}: {}.".format(operation, ", ".join(sorted(unsupported))))
     if operation in ("show", "watch", "report", "fetch"):
         validate_job_id(request.get("job_id"))
-    if "json" in request and not isinstance(request["json"], bool):
-        raise JobmonError("json must be a boolean.")
+    for name in ("json", "exit_on_completion"):
+        if name in request and not isinstance(request[name], bool):
+            raise JobmonError(name + " must be a boolean.")
     for name, low, high in (("interval", 1, 86400), ("count", 1, 1000000), ("days", 1, 3650),
                             ("utc_offset_minutes", -1439, 1439)):
         if name in request and (type(request[name]) is not int or not low <= request[name] <= high):
@@ -930,6 +999,8 @@ def main(argv=None):
         if name == "watch":
             command.add_argument("--interval", type=int, default=5)
             command.add_argument("--count", type=int, help="stop after this many snapshots")
+            command.add_argument("--exit-on-completion", action="store_true",
+                                 help="stop after the newest saved run has a workload exit and all final samples")
     args = vars(parser.parse_args(argv))
     try:
         if args["operation"] == "_transport":

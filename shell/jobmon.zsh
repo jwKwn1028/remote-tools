@@ -52,6 +52,13 @@ _jobmon_request() {
     shift
     case $option in
       --json) request+=',"json":true' ;;
+      --exit-on-completion)
+        if [[ $operation != watch ]]; then
+          print -u2 -- "jobmon: $option is not valid for $operation."
+          return 2
+        fi
+        request+=',"exit_on_completion":true'
+        ;;
       --days|--interval|--count)
         if [[ $option == --days && $operation != (show|watch|report) ]] ||
            [[ $option != --days && $operation != watch ]]; then

@@ -329,10 +329,12 @@ cluster's `env.sh`:
 | `HPC_JOBMON_HOST`      | Unset by the canonical helper                    | SSH destination for job monitoring and deployment: an `~/.ssh/config` alias or `user@login-host`. Set it in a private local configuration or managed shell module. |
 | `HPC_JOBMON_TOOLS_DIR` | The clone containing the sourced `jobmon.zsh`    | Repository used by `hpc-jdeploy`. Set it only when the helpers are not sourced from a clone. Reporting does not need this directory.                          |
 
-Watch refresh rate, history range, JSON output, and watch refresh count are
+Watch refresh rate, history range, JSON output, watch refresh count, and stopping
+after a collected run finishes are
 command options, not `env.sh` toggles: use `hpc-jwatch JOB_ID --interval 5`,
 `hpc-jreport JOB_ID --days 90 --json`, or
-`hpc-jwatch JOB_ID --count 3`.
+`hpc-jwatch JOB_ID --count 3`. To stop after the newest saved run has a workload
+exit and all expected final samples, use `hpc-jwatch JOB_ID --exit-on-completion`.
 
 ## Add persistent collection to a batch script
 
@@ -487,6 +489,7 @@ separate queued monitor job or persistent login-node collection daemon.
 hpc-jwatch 123456 --interval 5
 hpc-jwatch --interval 5                 # no ID: choose from your running jobs
 hpc-jwatch 123456 --interval 5 --json   # newline-delimited JSON snapshots
+hpc-jwatch 123456 --exit-on-completion # stop after workload exit and final samples
 hpc-jfetch 123456 ./downloads
 ```
 
@@ -540,13 +543,46 @@ CLOCK        ELAPSED  SAMPLES  CPU LAST 30 s    CPU AVG    CPU MAX       MEMORY 
 Multi-node runs add a `NODE` column. A node that misses about two and a half
 sampling intervals, at least 30 seconds past its interval, produces one warning
 per stall rather than a growing age on every refresh. A final sample is marked
-`final`, and the wrapper's workload exit status is printed once when it is
-recorded; neither produces a stall warning afterwards. New collection errors are
-printed when they first appear. `--count N` stops after N refreshes, whether or
-not samples arrived, so a stalled collector cannot hold a bounded watch open.
+`final` and produces no further stall warnings for that node. When the wrapper
+records completion, the watch distinguishes a successful workload exit (`0`)
+from a nonzero exit and points to application logs when needed. It reports
+final samples as node counts, such as `1/2 nodes; waiting for final samples`, and
+updates the count as delayed samples arrive. An incomplete expected-node layout
+is named explicitly, even if the number of observed final samples matches the
+declared node count.
 
-`--json` is unchanged: every refresh emits one complete JSON snapshot, for
-scripts that parse the stream.
+Once all expected nodes have final samples, the watch prints the CPU average
+over sampled intervals and the sampled memory peak once. For multiple nodes,
+memory peaks are listed separately per node; they are not a concurrent total.
+Unavailable measurements remain unavailable. A synthetic completion example:
+
+```text
+11:28:02  Workload finished with exit code 1 (nonzero).
+11:28:02  Final samples: 1/1 node recorded.
+          CPU average (sampled intervals): 43.5% of allocated cores
+          Sampled memory peak: 27.37 GiB
+          Check application logs; run hpc-jreport 123456 for final Slurm status.
+          Watch remains open; press Ctrl-C to stop viewing.
+```
+
+The workload exit comes from the batch wrapper; final Slurm status still needs
+a fresh `hpc-jreport`. Watching stays open by default so later requeued runs can
+appear. Add `--exit-on-completion` to stop when the newest run currently visible
+in saved history has both a wrapper completion record and final samples from
+every expected node. Older completed runs cannot stop a watch of a newer active
+run. The option also stops immediately if that newest saved run is already
+complete when watching starts; it does not wait for a future requeue and does
+not establish a final scheduler state.
+
+Missing final samples or an unknown node layout leave the watch open. `--count N`
+still stops after N refreshes, whether or not samples arrived, so it can bound
+the wait; Ctrl-C also stops viewing. A normal automatic stop returns viewer exit
+status `0`, including when the recorded workload exit is nonzero. New collection
+errors are printed when they first appear.
+
+`--json` keeps the same report format: every refresh emits one complete JSON
+snapshot, for scripts that parse the stream. `--exit-on-completion` also works
+with it, emitting the final snapshot before closing without extra text.
 
 Only run directories are read as saved history. An unrelated entry beside them,
 such as the `.nfs` stub shared storage leaves behind when an open file is
@@ -753,6 +789,9 @@ ruff check jobmon tests
 
 `.github/workflows/checks.yml` runs the same checks on push and pull request,
 with the unit suite on both the supported Python floor and a current release.
+The unit suite also exercises the workstation helpers, so local test runs need
+Bash and Zsh. Each Python CI job installs Zsh before running those transport and
+terminal tests; the separate shell job's installed tools are not shared with it.
 
 Tests use synthetic accounting, cgroup/GPU fixtures, temporary private storage,
 and a fake SSH executable. They require no cluster connection. The optional
