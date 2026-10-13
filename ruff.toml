@@ -1,0 +1,10 @@
+# Keep the lint gate aligned with the formatting this project already follows.
+# A standalone ruff.toml avoids introducing a packaging layer for these files.
+line-length = 120
+
+[lint]
+# Deliberately without "I": the import blocks here are ordered by hand in a
+# style isort would rewrite, and it misreads the jobmon/ directory as a package.
+select = ["E", "F", "W"]
+# Tests put the source directory on sys.path before importing jobmon modules.
+ignore = ["E402"]

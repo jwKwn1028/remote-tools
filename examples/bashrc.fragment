@@ -1,0 +1,14 @@
+# shellcheck shell=bash
+# BEGIN personal jobmon (place before any unrelated interactive setup as appropriate)
+case $- in
+    *i*)
+        if [ -r "$HOME/.config/jobmon/env.sh" ]; then
+            # shellcheck source=/dev/null
+            . "$HOME/.config/jobmon/env.sh"
+        fi
+        jobmon() {
+            "${JOBMON_PYTHON:-python3}" "$HOME/.local/libexec/jobmon/jobmon.py" "$@"
+        }
+        ;;
+esac
+# END personal jobmon

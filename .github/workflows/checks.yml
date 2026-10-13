@@ -1,0 +1,50 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    # 22.04 still provides the 3.8 floor this project supports.
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit, transport, wrapper, and publication tests
+        run: python3 -m unittest discover -s tests -v
+
+  shell:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Syntax
+        run: |
+          zsh -n shell/jobmon.zsh
+          bash -n shell/deploy-jobmon.sh
+          bash -n examples/monitored-job.sh
+          bash -n examples/env.sh
+          bash -n examples/bashrc.fragment
+      - name: shellcheck
+        run: shellcheck shell/deploy-jobmon.sh examples/monitored-job.sh examples/env.sh examples/bashrc.fragment
+
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check jobmon tests

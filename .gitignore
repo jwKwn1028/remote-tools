@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Keep machine-local configuration and credentials out of a public repository.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# hpc-jfetch output contains private job history.
+/downloads/
+jobmon-*.tar.gz
+*.partial
+
+# Generated documentation can retain text removed from its Markdown source.
+/README.pdf
+commitmsg.txt
