@@ -15,7 +15,7 @@ export JOBMON_DATA_DIR="${JOBMON_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}
 
 # 3. Batch-wrapper sampling interval: 1 to 86400 seconds (fractions allowed).
 # Direct collect.py calls use --interval; this does not change watch refreshes.
-export JOBMON_INTERVAL="${JOBMON_INTERVAL:-30}"
+export JOBMON_INTERVAL="${JOBMON_INTERVAL:-60}"
 
 # 4. Optional GPU mapping: unique full UUIDs, verified for THIS allocation/node.
 # Unset means no GPU samples. Numeric ordinals and MIG UUIDs are unsupported.

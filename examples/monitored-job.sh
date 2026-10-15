@@ -151,7 +151,7 @@ if jobmon_run_dir=$("$jobmon_python" "$jobmon_collector" init); then
     export JOBMON_RUN_DIR=$jobmon_run_dir
     if [[ ${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}} == 1 ]]; then
         "$jobmon_python" "$jobmon_collector" run --run-dir "$jobmon_run_dir" \
-            --interval "${JOBMON_INTERVAL:-30}" &
+            --interval "${JOBMON_INTERVAL:-60}" &
         jobmon_monitor_pid=$!
     elif [[ ${JOBMON_ALLOW_OVERLAP:-0} == 1 ]]; then
         # Opt in only after site validation. Overlap may expose a different GPU set.
@@ -159,7 +159,7 @@ if jobmon_run_dir=$("$jobmon_python" "$jobmon_collector" init); then
             --ntasks="${SLURM_JOB_NUM_NODES:-$SLURM_NNODES}" --ntasks-per-node=1 \
             --cpus-per-task=1 --mem=64M \
             "$jobmon_python" "$jobmon_collector" run --run-dir "$jobmon_run_dir" \
-            --interval "${JOBMON_INTERVAL:-30}" &
+            --interval "${JOBMON_INTERVAL:-60}" &
         jobmon_monitor_pid=$!
     else
         printf 'jobmon: multi-node collection needs a site-validated launcher; set JOBMON_ALLOW_OVERLAP=1 after validation.\n' >&2

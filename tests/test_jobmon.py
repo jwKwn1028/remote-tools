@@ -1589,6 +1589,39 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(mask, "022")
             self.assertEqual(Path(archive).read_bytes(), b"archive")
 
+    def test_default_sampling_interval_is_one_minute(self):
+        # The wrapper, the collector, and the example env.sh must agree, or a copied
+        # env.sh silently pins a different default.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            log, run_dir = base / "collector.jsonl", base / "run"
+            stub = base / "collect.py"
+            stub.write_text("import json, os, pathlib, sys\n"
+                            "with open(os.environ['STUB_LOG'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                            "run = pathlib.Path(os.environ['STUB_RUN'])\n"
+                            "if sys.argv[1] == 'init':\n"
+                            "    run.mkdir(exist_ok=True); print(run)\n"
+                            "elif sys.argv[1] == 'run':\n"
+                            "    (run / 'stub.ready.json').write_text('{}')\n")
+            env = {key: value for key, value in os.environ.items() if not key.startswith(("JOBMON_", "SLURM_"))}
+            env.update(HOME=str(base), PATH=os.defpath, JOBMON_PYTHON=sys.executable, JOBMON_COLLECTOR=str(stub),
+                       STUB_LOG=str(log), STUB_RUN=str(run_dir))
+            result = subprocess.run(["/bin/bash", str(ROOT / "examples/monitored-job.sh"), "true"], env=env,
+                                    capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            started = [call for call in map(json.loads, log.read_text().splitlines()) if call[0] == "run"]
+            self.assertEqual(len(started), 1, log.read_text())
+            self.assertEqual(started[0][started[0].index("--interval") + 1], "60")
+            sourced = subprocess.run(["sh", "-c", '. "$1"; printf %s "$JOBMON_INTERVAL"', "sh",
+                                      str(ROOT / "examples/env.sh")], env=env, capture_output=True, text=True,
+                                     timeout=15, stdin=subprocess.DEVNULL)
+            self.assertEqual(sourced.stdout, "60", sourced.stderr)
+        calls = []
+        with patch.object(collect, "collect", lambda *args: calls.append(args)), \
+                patch.object(collect.signal, "signal"):
+            self.assertEqual(collect.main(["run", "--run-dir", "unused"]), 0)
+        self.assertEqual(calls[0][1], 60)
+
     def test_monitor_failure_preserves_workload_exit_code(self):
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, JOBMON_COLLECTOR=str(Path(directory) / "missing.py"), JOBMON_PYTHON=sys.executable)

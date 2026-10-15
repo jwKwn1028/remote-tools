@@ -504,7 +504,7 @@ def wait_for_next_sample(run_dir, stop, deadline, poll=STOP_POLL_SECONDS):
         stop_requested(run_dir, stop)
 
 
-def collect(run_dir, interval=30, once=False, stop=None):
+def collect(run_dir, interval=60, once=False, stop=None):
     if not 1 <= interval <= 86400:
         raise JobmonError("Collection interval must be between 1 and 86400 seconds.")
     metadata = load_run(run_dir)
@@ -573,7 +573,7 @@ def main(argv=None):
     subs.add_parser("init", help="create one shared run directory inside the allocation")
     sample = subs.add_parser("run", help="run one collector on this allocation node")
     sample.add_argument("--run-dir", required=True)
-    sample.add_argument("--interval", type=float, default=30)
+    sample.add_argument("--interval", type=float, default=60)
     sample.add_argument("--once", action="store_true")
     for name in ("stop", "finish"):
         command = subs.add_parser(name)

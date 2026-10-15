@@ -242,7 +242,7 @@ export JOBMON_PYTHON="${JOBMON_PYTHON:-python3}"
 export JOBMON_DATA_DIR="${JOBMON_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/jobmon}"
 
 # Sampling period used by the batch wrapper, in seconds.
-export JOBMON_INTERVAL="${JOBMON_INTERVAL:-30}"
+export JOBMON_INTERVAL="${JOBMON_INTERVAL:-60}"
 ```
 
 The default data directory is appropriate only if that location is shared.
@@ -300,7 +300,7 @@ except the three switches, which enable their behavior only for the exact value
 | ---------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `JOBMON_PYTHON`        | `python3`                                      | Existing Python 3.8+ interpreter, as one executable name or absolute path. No command-line arguments. Used by shell helpers and the batch wrapper.                                                                                                                                                                      |
 | `JOBMON_DATA_DIR`      | `${XDG_STATE_HOME:-$HOME/.local/state}/jobmon` | Absolute private shared history directory visible at the same path on login/compute nodes. Relative configured paths are rejected. Directories must be owned by you and mode 700.                                                                                                                                       |
-| `JOBMON_INTERVAL`      | `30`                                           | Collection period in seconds, between 1 and 86400; fractions are accepted. The batch wrapper passes it to `collect.py run --interval`. It does not change watch refreshes, and direct collector invocations use their own `--interval` argument.                                                                        |
+| `JOBMON_INTERVAL`      | `60`                                           | Collection period in seconds, between 1 and 86400; fractions are accepted. The batch wrapper passes it to `collect.py run --interval`. It does not change watch refreshes, and direct collector invocations use their own `--interval` argument.                                                                        |
 | `JOBMON_GPU_UUIDS`     | Unset; GPU collection off                      | Comma-separated, unique, full `GPU-…` UUIDs that you have verified belong to the allocation on that node. Numeric ordinals and MIG UUIDs are unsupported.                                                                                                                                                               |
 | `JOBMON_GPU_EXCLUSIVE` | Disabled                                       | `1` asserts verified exclusive use without sharing/MPS/MIG; supported device utilization may then be attributed to the job. `0` keeps shared-device context. Detected MIG prevents exclusive attribution even when set to `1`.                                                                                          |
 | `JOBMON_ALLOW_OVERLAP` | `0`                                            | `1` enables the example wrapper's multi-node `srun --overlap` monitor step after site validation. With `0`, a multi-node workload still runs but collection is skipped with a diagnostic. Single-node collection is unaffected.                                                                                         |
@@ -470,7 +470,12 @@ loss cannot guarantee cleanup or completion records. Once the workload finishes,
 interruptions during the bounded monitor shutdown preserve its recorded exit
 status.
 
-Collection defaults to 30 seconds; set `JOBMON_INTERVAL` to change it. There is
+Collection defaults to 60 seconds; set `JOBMON_INTERVAL` to change it. A shorter
+interval catches briefer memory spikes in the sampled peak and makes `CPU LAST`
+react faster, at the cost of more records; process-tree sampling has no kernel
+high-water mark to fall back on. An `env.sh` copied from an earlier example may
+still pin `JOBMON_INTERVAL` to 30; edit or remove that line to use the default.
+The interval is fixed when a job starts, so running jobs keep theirs. There is
 one collector per node, protected by an advisory lock, with a separate JSONL
 stream for every collector start. Samples are flushed as they are written.
 The shared filesystem must support advisory locks. Files are mode 600 and
@@ -513,14 +518,14 @@ The text view states everything that cannot change during the watch once: the
 scheduler snapshot and the time it was taken, site diagnostics, and for each run
 its nodes, sampling interval, measurement scope, and what is not measured. After
 that it prints a row only when a node delivers a new sample, so a 5-second
-refresh against 30-second sampling stays quiet in between. For example:
+refresh against 60-second sampling stays quiet in between. For example:
 
 ```text
-CLOCK        ELAPSED  SAMPLES  CPU LAST 30 s    CPU AVG    CPU MAX       MEMORY   MEMORY MAX
-11:25:29     7:26:31      894         101.2%      43.4%     101.2%    27.37 GiB    27.37 GiB
-11:25:59     7:27:01      895         101.8%      43.5%     101.8%    27.37 GiB    27.37 GiB
-11:26:29     7:27:31      896          98.0%      43.5%     101.8%     2.01 GiB    27.37 GiB
-11:27:46  no new sample for 77 s (expected every 30 s)
+CLOCK        ELAPSED  SAMPLES  CPU LAST 60 s    CPU AVG    CPU MAX       MEMORY   MEMORY MAX
+11:25:29     7:26:31      447         101.2%      43.4%     101.2%    27.37 GiB    27.37 GiB
+11:26:29     7:27:31      448         101.8%      43.5%     101.8%    27.37 GiB    27.37 GiB
+11:27:29     7:28:31      449          98.0%      43.5%     101.8%     2.01 GiB    27.37 GiB
+11:30:12  no new sample for 163 s (expected every 60 s)
 ```
 
 - `CLOCK` is when each sample was taken, in your workstation's time zone:
