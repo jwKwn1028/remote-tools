@@ -44,6 +44,70 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(requested_memory("4Gn", 8, 2)["allocation_bytes"], 8 * 1024 ** 3)
         self.assertIsNone(requested_memory("4G", 8, 2)["allocation_bytes"])
 
+    def test_queue_names_preserve_separators_and_keep_job_and_user_scope(self):
+        calls = []
+
+        def runner(argv):
+            calls.append(argv)
+            return ("123_7|{user}|RUNNING|1:00|8|1|node1|simulation | phase 2 |\n"
+                    "123_8|{user}|RUNNING|1:00|8|1|node1|other task\n"
+                    "123_7|another-user|RUNNING|1:00|8|1|node1|foreign job\n").format(user=identity())
+
+        rows = SlurmBackend(runner).jobs("123_7")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["job_name"], "simulation | phase 2 |")
+        self.assertEqual(rows[0]["job_id"], "123_7")
+        self.assertEqual(len(calls), 1)
+        for argument in ("--local", "--array", "--user=" + identity(), "--jobs=123_7"):
+            self.assertIn(argument, calls[0])
+        self.assertIn("--format=%i|%u|%T|%M|%C|%D|%R|%j", calls[0])
+        with self.assertRaises(JobmonError):
+            SlurmBackend(lambda argv: "123_7|user|RUNNING").jobs("123_7")
+
+    def test_jobs_text_escapes_name_controls_and_json_preserves_the_name(self):
+        row = {"job_id": "123_7", "state": "RUNNING", "elapsed": "1:00", "cpus": "8", "nodes": "1",
+               "reason_or_nodes": "node1", "job_name": "simulation\tphase\x1b[31m"}
+        with patch.object(SlurmBackend, "jobs", return_value=[row]), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            jobmon.execute("jobs")
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].endswith("\tJOB NAME"))
+        self.assertEqual(len(lines[1].split("\t")), 7)
+        self.assertTrue(lines[1].endswith("\tsimulation\\tphase\\x1b[31m"))
+        self.assertNotIn("\x1b", output.getvalue())
+        with patch.object(SlurmBackend, "jobs", return_value=[row]), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            jobmon.execute("jobs", as_json=True)
+        self.assertEqual(json.loads(output.getvalue())["jobs"][0]["job_name"], row["job_name"])
+
+    def test_watch_header_prefers_queue_then_latest_accounting_and_saved_names(self):
+        queue = {"job_name": "queue simulation", "state": "RUNNING", "elapsed": "1:00", "cpus": "8",
+                 "nodes": "1", "reason_or_nodes": "node1"}
+        report = {"job_id": "123_7", "scheduler_snapshot_at": "2026-09-03T00:00:00+00:00", "errors": [],
+                  "scheduler": {"queue": [queue], "live_steps": [], "errors": [], "accounting": [
+                      {"job_name": "older accounting", "submit": "2026-09-01T00:00:00", "state": "COMPLETED",
+                       "exit_code": "0:0"},
+                      {"job_name": "newer accounting", "submit": "2026-09-02T00:00:00", "state": "COMPLETED",
+                       "exit_code": "0:0"}]},
+                  "runs": [{"metadata": {"job_name": "older saved", "created_at": "2026-09-01T00:00:00+00:00"}},
+                           {"metadata": {"job_name": "newer saved", "created_at": "2026-09-02T00:00:00+00:00"}}]}
+
+        def title():
+            return jobmon.watch_header(report, dt.timezone.utc)[0]
+
+        self.assertTrue(title().startswith("Job 123_7 (queue simulation):"))
+        report["scheduler"]["queue"] = []
+        self.assertTrue(title().startswith("Job 123_7 (newer accounting):"))
+        report["scheduler"]["accounting"] = []
+        self.assertTrue(title().startswith("Job 123_7 (newer saved):"))
+        report["runs"][-1]["metadata"]["job_name"] = "simulation\tα\x1b[2J"
+        self.assertIn("(simulation\\tα\\x1b[2J)", title())
+        self.assertNotIn("\x1b", title())
+        for run in report["runs"]:
+            run["metadata"].pop("job_name")
+        self.assertTrue(title().startswith("Job 123_7 (name unavailable):"))
+
     def test_unreadable_memory_request_has_no_invented_scope(self):
         # The trailing letter of an unparseable request is not a per-CPU scope.
         for value in ("abc", "n", "c", "?c", "", None):
@@ -138,9 +202,11 @@ class SchedulerTests(unittest.TestCase):
     def test_bounded_array_accounting_and_requeues(self):
         calls = []
         rows = [
-            {"JobID": "123_7", "JobIDRaw": "130", "Submit": "2026-09-01T10:00:00", "TotalCPU": "00:00:10"},
+            {"JobID": "123_7", "JobIDRaw": "130", "Submit": "2026-09-01T10:00:00", "TotalCPU": "00:00:10",
+             "JobName": "first simulation"},
             {"JobID": "123_7.batch", "JobIDRaw": "130.batch", "Submit": "2026-09-01T10:00:00", "MaxRSS": "1G"},
-            {"JobID": "123_7", "JobIDRaw": "130", "Submit": "2026-09-02T10:00:00", "TotalCPU": "00:00:20"},
+            {"JobID": "123_7", "JobIDRaw": "130", "Submit": "2026-09-02T10:00:00", "TotalCPU": "00:00:20",
+             "JobName": "restart | simulation |"},
             {"JobID": "123_7.batch", "JobIDRaw": "130.batch", "Submit": "2026-09-02T10:00:00", "MaxRSS": "2G"},
             {"JobID": "123_8", "JobIDRaw": "131", "Submit": "2026-09-02T10:00:00"},
             {"JobID": "123_7", "JobIDRaw": "999", "User": "another-user", "UID": "999999"},
@@ -160,11 +226,26 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(reports[0]["job_id_raw"], "130")
         self.assertEqual(len(reports[0]["steps"]), 1)
         self.assertEqual(reports[1]["steps"][0]["MaxRSS"], "2G")
+        self.assertEqual([run["job_name"] for run in reports], ["first simulation", "restart | simulation |"])
         query = calls[1]
         for expected in ("--jobs=123_7", "--duplicates", "--endtime=now", "--user=" + identity()):
             self.assertIn(expected, query)
         self.assertTrue(any(value.startswith("--starttime=") for value in query))
         self.assertNotIn("-X", query)
+
+    def test_accounting_without_the_optional_job_name_field_remains_available(self):
+        calls = []
+
+        def runner(argv):
+            calls.append(argv)
+            if "--helpformat" in argv:
+                return "JobIDRaw JobID User UID State"
+            return "123|123|{}|{}|COMPLETED\n".format(identity(), os.getuid())
+
+        rows = SlurmBackend(runner).accounting("123")
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["job_name"])
+        self.assertFalse(any("JobName" in argument for argument in calls[-1]))
 
     def test_unavailable_capability_does_not_guess_fields(self):
         calls = []
@@ -293,6 +374,22 @@ class StorageTests(unittest.TestCase):
         self.assertEqual((self.run / "metadata.json").stat().st_mode & 0o777, 0o600)
         another = collect.initialize(runner=lambda argv: "node1\n")
         self.assertNotEqual(another, self.run)
+
+    def test_saved_job_name_is_available_offline_and_older_metadata_remains_readable(self):
+        with patch.dict(os.environ, {"SLURM_JOB_NAME": "synthetic simulation"}):
+            directory = collect.initialize(runner=lambda argv: "node1\n")
+        metadata = collect.load_run(directory)
+        self.assertEqual(metadata["job_name"], "synthetic simulation")
+        run = jobmon.RunHistory(directory, metadata).summary()
+        report = self.report_for(run)
+        self.assertTrue(jobmon.watch_header(report, dt.timezone.utc)[0].startswith(
+            "Job 123_7 (synthetic simulation):"))
+        del metadata["job_name"]
+        (directory / "metadata.json").write_text(json.dumps(metadata))
+        older = collect.load_run(directory)
+        self.assertNotIn("job_name", older)
+        report = self.report_for(jobmon.RunHistory(directory, older).summary())
+        self.assertIn("(name unavailable)", jobmon.watch_header(report, dt.timezone.utc)[0])
 
     def test_storage_probe_and_absolute_configuration_are_required(self):
         status = collect.verify_storage_probe(self.root)
@@ -673,7 +770,8 @@ class StorageTests(unittest.TestCase):
                 return {"ownership_verified": True, "accounting": [], "live_steps": [],
                         "errors": ["scheduler note"],
                         "queue": [{"job_id": "123_7", "user": "u", "state": "RUNNING", "elapsed": "1:00",
-                                   "cpus": "8", "nodes": "1", "reason_or_nodes": "node1"}]}
+                                   "cpus": "8", "nodes": "1", "reason_or_nodes": "node1",
+                                   "job_name": "synthetic-simulation"}]}
 
         sleeps = []
 
@@ -697,6 +795,7 @@ class StorageTests(unittest.TestCase):
             lambda calls: calls == 3 and self.append(self.record(tick=60, cpu_delta=60)), 6, [base + 35])
         self.assertEqual(len(sleeps), 5)
         for once in ("Scheduler at 00:01:05", "elapsed 1:00", "not refreshed while watching",
+                     "Job 123_7 (synthetic-simulation): watching saved samples",
                      "Diagnostic: scheduler note", "  Memory: job cgroup", "  Coverage: ", "CPU LAST 30 s",
                      "CLOCK is your workstation's time, UTC+00:00", "as in squeue's TIME column"):
             self.assertEqual(text.count(once), 1, once)
@@ -1430,8 +1529,9 @@ class TransportTests(unittest.TestCase):
             self.assertNotIn("utc_offset_minutes", self.last_request(capture))
 
     def job_table(self, *rows):
-        return "JOB ID\tSTATE\tELAPSED\tCPUS\tNODES\tREASON / NODELIST\n" + "".join(
-            "{}\t{}\t1:00\t4\t1\tnode1\n".format(job_id, state) for job_id, state in rows)
+        return "JOB ID\tSTATE\tELAPSED\tCPUS\tNODES\tREASON / NODELIST\tJOB NAME\n" + "".join(
+            "{}\t{}\t1:00\t4\t1\tnode1\t{}\n".format(row[0], row[1], row[2] if len(row) > 2 else "job-" + row[0])
+            for row in rows)
 
     def pick(self, table, keys=(), args=(), lines=24):
         """Run hpc-jwatch in a pseudo-terminal; return (screen output, exit status, requests)."""
@@ -1535,6 +1635,25 @@ class TransportTests(unittest.TestCase):
                 # Ctrl-C is read as a key while the menu is open, and signal keys come back.
                 self.assertNotIn("^C", after)
                 self.assertIn("terminal: isig echo", after)
+
+    def test_jwatch_picker_shows_names_and_selects_by_id(self):
+        long_name = "second simulation with a long descriptive name"
+        table = self.job_table(("900_0", "RUNNING", "first simulation"), ("900_1", "RUNNING", long_name))
+        screen, status, requests = self.pick(table, [b"j", b"\n"])
+        self.assertEqual(status, 0, screen)
+        self.assertIn("NAME", screen)
+        self.assertIn("first simulation", screen)
+        self.assertIn(long_name[:20], screen)
+        self.assertNotIn(long_name, screen)
+        self.assertEqual(requests[-1]["job_id"], "900_1")
+
+    def test_jwatch_picker_accepts_an_older_jobs_table_without_names(self):
+        table = self.job_table(("900_0", "RUNNING"), ("900_1", "RUNNING"))
+        older = "\n".join(line.rsplit("\t", 1)[0] for line in table.splitlines()) + "\n"
+        screen, status, requests = self.pick(older, [b"\n"])
+        self.assertEqual(status, 0, screen)
+        self.assertIn("unavailable", screen)
+        self.assertEqual(requests[-1]["job_id"], "900_0")
 
     def test_jwatch_with_one_running_job_watches_it_without_a_menu(self):
         screen, status, requests = self.pick(self.job_table(("900_0", "RUNNING"), ("900_1", "PENDING")))

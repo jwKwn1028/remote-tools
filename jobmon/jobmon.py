@@ -444,6 +444,14 @@ def display_scalar(value):
     return "unavailable" if value is None or value == "" else str(value)
 
 
+def display_job_name(value):
+    if not isinstance(value, str) or not value.strip():
+        return "unavailable"
+    # Keep names on one terminal/table line without interpreting control codes.
+    return "".join(char if char.isprintable() else char.encode("unicode_escape").decode("ascii")
+                   for char in value.strip())
+
+
 def display_bytes(value, missing="unavailable"):
     # Binary units for reading; JSON output keeps exact byte counts.
     if value is None:
@@ -627,11 +635,24 @@ def cpu_cell(percent, cores):
     return "-" if cores is None else "{:.1f} cores".format(cores)
 
 
+def watch_job_name(report):
+    scheduler = report["scheduler"]
+    sources = list(scheduler["queue"])
+    sources.extend(sorted(scheduler["accounting"], key=lambda row: (
+        timestamp_seconds(row.get("submit")) or 0, timestamp_seconds(row.get("start")) or 0), reverse=True))
+    saved = sorted(report["runs"], key=lambda run: (
+        timestamp_seconds(run["metadata"].get("created_at")) or 0), reverse=True)
+    sources.extend(run["metadata"] for run in saved)
+    return next((source["job_name"] for source in sources
+                 if isinstance(source.get("job_name"), str) and source["job_name"].strip()), None)
+
+
 def watch_header(report, tz):
     scheduler = report["scheduler"]
     at = clock_time(timestamp_seconds(report["scheduler_snapshot_at"]), tz)
-    lines = ["Job {}: watching saved samples; CLOCK is {}; Ctrl-C stops viewing".format(
-        report["job_id"], display_zone(tz))]
+    name = watch_job_name(report)
+    label = "{} ({})".format(report["job_id"], display_job_name(name) if name is not None else "name unavailable")
+    lines = ["Job {}: watching saved samples; CLOCK is {}; Ctrl-C stops viewing".format(label, display_zone(tz))]
     # Watch reads Slurm once, so say when, rather than repeat a frozen elapsed time.
     for queue in scheduler["queue"]:
         lines.append("Scheduler at {}: {state}, elapsed {elapsed}, {cpus} CPUs on {nodes} node(s), "
@@ -906,9 +927,10 @@ def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=
         if as_json:
             emit({"schema_version": SCHEMA_VERSION, "jobs": rows}, True)
         else:
-            print("JOB ID\tSTATE\tELAPSED\tCPUS\tNODES\tREASON / NODELIST")
+            print("JOB ID\tSTATE\tELAPSED\tCPUS\tNODES\tREASON / NODELIST\tJOB NAME")
             for row in rows:
-                print("{job_id}\t{state}\t{elapsed}\t{cpus}\t{nodes}\t{reason_or_nodes}".format(**row))
+                print("{job_id}\t{state}\t{elapsed}\t{cpus}\t{nodes}\t{reason_or_nodes}".format(**row)
+                      + "\t" + display_job_name(row.get("job_name")))
         return
     validate_job_id(job_id)
     if operation == "fetch":

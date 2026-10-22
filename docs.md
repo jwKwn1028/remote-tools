@@ -1,91 +1,52 @@
 # jobmon user guide
 
-Personal Slurm monitoring using **Python 3.8+ and the standard library**.
-Neither `jobstats` nor `seff` is required. There are no pip, Conda, system-package,
-Prometheus, or administrator setup steps.
+Jobmon combines Slurm reports with optional allocation-local CPU, memory, and GPU
+history. It needs Python 3.8+ and the standard library; no administrator access
+or Python packages are required. Slurm remains authoritative for job state.
 
-This guide covers first-time setup, normal daily use, persistent collection,
-measurement semantics, and validation. Live cluster behavior still depends on
-site Slurm, cgroup, GPU, and shared-filesystem configuration.
+[Setup](#setup) · [Commands](#commands) · [Configuration](#configure-the-remote-environment) ·
+[Collection](#add-persistent-collection) · [Watch](#watch-saved-history) ·
+[Archives](#fetch-and-read-offline) · [Measurements](#what-measurements-mean) ·
+[Troubleshooting](#troubleshooting)
 
-The initial rollout described here is CPU-only. Leave `JOBMON_GPU_UUIDS` and
-`JOBMON_GPU_EXCLUSIVE` unset. The GPU sections document a later, explicit opt-in
-after device ownership and site behavior have been verified.
+## Setup
 
-The repository helper is the canonical workstation interface. A dotfile manager
-should install a small module that sets private local values and sources
-`shell/jobmon.zsh`; do not maintain a copied implementation:
+The cluster needs an existing Python 3.8+ interpreter, `squeue`, and `sacct`;
+`sstat` is optional. Completed-job accounting requires site accounting storage.
+Deployment uses ordinary tools including Bash, `tar`, `mktemp`, `sha256sum`,
+`cmp`, and `readlink`, plus SSH for workstation installation.
 
-```zsh
-cd path/to/your/clone
-export HPC_JOBMON_HOST=your-existing-ssh-alias
-source shell/jobmon.zsh
-hpc-jdeploy            # preview
-hpc-jdeploy --apply    # verified, versioned activation of Python tools and wrapper
-# Create ~/.config/jobmon/env.sh as described below, then:
-hpc-jstorage-init      # one-time login-side shared-storage marker
-hpc-jdoctor
-```
-
-Set the host through your local environment or private dotfile data. Do not
-commit a real SSH alias, username, cluster address, or storage path to this
-repository.
-
-## Start with scheduler reports
-
-On your workstation, set the SSH destination: an alias from `~/.ssh/config`, or
-`user@login-host` (see [Choosing the SSH destination](#choosing-the-ssh-destination)):
+If Python or Slurm needs modules or custom paths,
+[configure the remote environment](#configure-the-remote-environment) first.
+Then, on your workstation:
 
 ```zsh
 cd path/to/your/clone
 export HPC_JOBMON_HOST=your-existing-ssh-alias
 source shell/jobmon.zsh
-
-# Read-only preview: shows host, four sources, release directory, and wrapper link.
-bash shell/deploy-jobmon.sh
-# Validate, compile, and activate a versioned release on that host.
-bash shell/deploy-jobmon.sh --apply
-
-hpc-jstorage-init
+hpc-jdeploy          # preview
+hpc-jdeploy --apply  # install the verified release
 hpc-jdoctor
 hpc-jobs
-hpc-job 123456
-hpc-jreport 123456 --json
-hpc-jreport 123456_7 --days 90
 ```
 
-The remote requirements for scheduler reports are `squeue`, `sacct`, and an
-existing Python 3.8+ interpreter. `sacct` additionally requires the site to run
-accounting storage; where it is disabled, completed jobs have no scheduler
-record at all and only the opt-in collector retains their usage.
-`sstat` adds an optional live step snapshot.
-Verified deployment also expects standard workstation/cluster tools `ssh`,
-`tar`, `mktemp`, and `sha256sum`, plus remote Bash, `cmp`, and `readlink`.
-Installing on the cluster itself with `--local` needs no `ssh`.
-Commands and accounting fields are checked at runtime; unavailable data carries
-diagnostics. Scheduler failures do not prevent reading your private saved history.
-No helper installs or deploys anything implicitly.
+For future shells, source the canonical helper from your Zsh configuration.
+A dotfile manager should install a thin module that reads private settings and
+sources this file, rather than copying its functions. Keep real hostnames,
+usernames, and storage paths in private configuration.
 
-### Choosing the SSH destination
+### SSH destination and authentication
 
-`HPC_JOBMON_HOST`, or the installer's first argument, is passed to `ssh` as the
-destination. It may be an alias from `~/.ssh/config`, or a plain
-`user@login-host` when the default port and your key already work; no alias is
-required. Only letters, digits, and `_ . @ : -` are accepted, and the value may
-not begin with `-`, so ports, SSH options, and `ssh://` URLs cannot be passed
-through it. Put a non-default port, a jump host, or a specific identity file in a
-`Host` block of `~/.ssh/config` and use that block's name.
+`HPC_JOBMON_HOST` accepts an SSH config alias or `user@login-host`. Allowed
+characters are letters, digits, and `_ . @ : -`; the value cannot start with
+`-`. Put ports, jump hosts, and identity files in `~/.ssh/config`, rather than
+passing SSH options or URLs as the destination.
 
-### Password and two-factor logins
+Helpers use `BatchMode=yes`: password, passphrase, and two-factor prompts fail
+with status 255. Load a key into `ssh-agent`, or, if site policy permits, share
+an interactive connection:
 
-The helpers and the installer run `ssh` with `BatchMode=yes`, so they never stop
-at a password, passphrase, or one-time-code prompt. Such a login fails at once
-with SSH exit status 255. A passphrase-protected key loaded into `ssh-agent`
-satisfies batch mode. Where the site requires an interactive second factor, let
-one interactive login carry the others by sharing its connection. In
-`~/.ssh/config`, with placeholder values:
-
-```
+```text
 Host your-existing-ssh-alias
     HostName login-host
     User your-cluster-username
@@ -94,286 +55,161 @@ Host your-existing-ssh-alias
     ControlPersist 8h
 ```
 
-Log in once with `ssh your-existing-ssh-alias` and complete the prompts. While
-that master connection lasts, `hpc-*` commands reuse it without prompting.
-`ssh -O check your-existing-ssh-alias` reports whether it is active, and
-`ssh -O exit your-existing-ssh-alias` closes it. Check your site's policy first;
-some centers limit or forbid persistent connections.
+Log in once with `ssh your-existing-ssh-alias` and complete authentication.
+Use `ssh -O check your-existing-ssh-alias` to check the shared connection or
+`ssh -O exit your-existing-ssh-alias` to close it.
 
-### Installing from the cluster itself
+### Install directly on the cluster
 
-Without SSH from a workstation, for example from a web-portal shell, copy or
-clone this repository onto the cluster and run the same installer there:
+For a web-portal shell or a cluster without workstation SSH, clone or copy the
+repository there and run:
 
 ```sh
-cd path/to/your/clone
-bash shell/deploy-jobmon.sh --local          # read-only preview
-bash shell/deploy-jobmon.sh --local --apply  # verified, versioned activation
+bash shell/deploy-jobmon.sh --local          # preview
+bash shell/deploy-jobmon.sh --local --apply
 ```
 
-`--local` installs into the account running it and makes no SSH connection. It
-applies the same checksum, compilation, wrapper-syntax, and refusal checks and
-builds the same `~/.local/libexec/jobmon` release and wrapper link, so a later
-`hpc-jdeploy --apply` from a workstation upgrades it in place. Run it on the
-cluster, not on a workstation. Afterwards use the direct cluster commands shown
-under [Day-to-day workflow](#day-to-day-workflow), or the `jobmon` function from
-`examples/bashrc.fragment`. Do not copy the files into place by hand: deployment
-refuses to replace an unrelated file where a managed link belongs, so a hand-made
-copy blocks later upgrades.
-
-## Day-to-day workflow
-
-The workstation helper is the normal interface. Source it from your Zsh startup
-configuration once, or source it in a terminal before use:
-
-```zsh
-export HPC_JOBMON_HOST=your-existing-ssh-alias
-source path/to/your/clone/shell/jobmon.zsh
-```
-
-If a dotfile manager already installs a module that sources this file, do not add
-it to `PATH` or source a second copy. After applying that module, start a new
-shell once and confirm that the functions are available:
-
-```zsh
-exec zsh
-type hpc-jobs
-type hpc-jstorage-init
-```
-
-Before submitting work, an occasional `hpc-jdoctor` confirms the interpreter,
-Slurm commands, executable batch wrapper, private storage, and login-side storage
-probe. It also reports
-`accounting_storage` as `available`, `disabled`, or `unknown`; a `disabled`
-verdict means `sacct` cannot describe any job at this site, so completed-job
-reports depend entirely on collected samples. The check makes one timeout-limited
-accounting query for your account on the local cluster, over a fixed one-minute
-window. Help and version output alone do not establish storage availability;
-query failures other than explicit disabled-storage errors leave it `unknown`.
-`hpc-jobs` is a
-quick view of your current queue:
-
-```zsh
-hpc-jdoctor
-hpc-jobs
-```
-
-Submit jobs normally with `sbatch`. Use `examples/monitored-job.sh` inside the
-batch script only for jobs whose sampled history you want to retain. After Slurm
-prints the job ID, run the monitoring commands on the workstation:
-
-```zsh
-hpc-job 123456                         # one current scheduler/history report
-hpc-jwatch 123456 --interval 5         # follow saved samples; Ctrl-C stops viewing
-hpc-jwatch                             # choose one of your running jobs, then watch it
-hpc-jreport 123456                     # final human-readable report
-hpc-jreport 123456 --days 90 --json    # machine-readable or older accounting
-hpc-jfetch 123456 ./downloads          # optional private local archive
-```
-
-Nothing else normally needs to be started manually on the cluster. The batch
-wrapper starts and stops the collector inside the allocation. Do not start a
-collector on the login node. If a running job was submitted without the wrapper,
-`hpc-job` can still report scheduler data, but `hpc-jwatch` will have no
-persistent allocation-local CPU or memory samples.
-
-Use the exact array task ID, such as `123456_7`, when applicable. Watching never
-starts or stops collection; the batch wrapper owns the collectors. Re-run
-`hpc-jreport` after completion to refresh final Slurm accounting.
-
-When this bundle changes, preview and apply another deployment. The installer
-verifies checksums and byte-compilation before switching the single `current`
-release link, so the three Python entry points and batch wrapper select the same
-release:
-
-```zsh
-hpc-jdeploy
-hpc-jdeploy --apply
-hpc-jdoctor
-```
-
-Older content-addressed releases remain under the remote
-`~/.local/libexec/jobmon/releases/` directory for manual inspection or rollback.
-The tool never submits jobs, deletes history, or runs a login-node daemon.
-
-If Python or Slurm requires a site module, adapt `examples/env.sh` into remote
-`~/.config/jobmon/env.sh`. This file must be quiet and work in a noninteractive
-POSIX shell. `JOBMON_PYTHON` selects a single interpreter path, without arguments.
-The transport, batch wrapper, and optional `examples/bashrc.fragment` source it.
-Creating the environment file and editing startup files remain manual steps;
-deployment installs the batch wrapper automatically.
-
-For direct use on the cluster:
+This installs into the current cluster account without SSH, using the same
+release checks and paths. Later workstation deployments upgrade it in place.
+For direct CLI use, create and source the remote environment described below,
+then choose a subcommand:
 
 ```sh
-python3 "$HOME/.local/libexec/jobmon/jobmon.py" storage-init
-python3 "$HOME/.local/libexec/jobmon/jobmon.py" doctor
-python3 "$HOME/.local/libexec/jobmon/jobmon.py" jobs
-python3 "$HOME/.local/libexec/jobmon/jobmon.py" show 123456
-python3 "$HOME/.local/libexec/jobmon/jobmon.py" report 123456 --json
+. "$HOME/.config/jobmon/env.sh"
+"$JOBMON_PYTHON" "$HOME/.local/libexec/jobmon/jobmon.py" jobs
+"$JOBMON_PYTHON" "$HOME/.local/libexec/jobmon/jobmon.py" report 123456 --json
 ```
 
-`show` includes an on-demand `sstat` snapshot for a running owned job. `report`
-combines recorded history and accounting. History searches default to 30 days;
-use `--days N` (1–3650) for older jobs. Requests are limited to your current local
-cluster and authenticated Unix account. Array task IDs retain their identity;
-step IDs, array ranges, and heterogeneous allocations are intentionally rejected
-as command arguments. Step records remain visible inside allocation reports.
+Other subcommands include `doctor`, `storage-init`, `show`, and `watch`.
+[examples/bashrc.fragment](examples/bashrc.fragment) provides an optional
+interactive `jobmon` function.
+
+### Deployment and upgrades
+
+Repeat `hpc-jdeploy`, review the preview, then run `hpc-jdeploy --apply` and
+`hpc-jdoctor` after updates. Deployment includes the three Python files in
+`jobmon/` and [examples/monitored-job.sh](examples/monitored-job.sh).
+It verifies `SHA256SUMS`, byte-compiles Python, and checks wrapper Bash syntax
+before atomically switching `~/.local/libexec/jobmon/current` to a
+content-addressed directory under `releases/`. Failed preflight leaves the
+active release unchanged.
+
+Stable Python links target `current/FILENAME`; the wrapper link is
+`~/.local/bin/monitored-job.sh -> ../libexec/jobmon/current/monitored-job.sh`.
+Identical manual copies can migrate to managed links. Unrelated files,
+directories, and symlinks are refused; review conflicts and move them aside
+before retrying. Existing bin permissions are preserved; the wrapper is mode 700.
+The wrapper and Python files must also be accessible on compute nodes.
+
+Environment and shell startup files remain manual configuration. Deployment
+starts no collectors and changes no submitted jobs.
+
+## Commands
+
+Run workstation commands after sourcing `shell/jobmon.zsh`:
+
+| Command | Purpose |
+| --- | --- |
+| `hpc-jobs` | Your current queue, including job names. |
+| `hpc-job 123456` | Scheduler/history report, plus optional live `sstat` steps. |
+| `hpc-jreport 123456` | Accounting and saved history; rerun for final Slurm status. |
+| `hpc-jreport 123456 --days 90 --json` | Older accounting or machine-readable output. |
+| `hpc-jwatch 123456 --interval 5` | Follow saved samples; Ctrl-C stops viewing. |
+| `hpc-jwatch` | Choose a running job by ID and name. |
+| `hpc-jwatch 123456 --exit-on-completion` | Stop after wrapper completion and all final samples. |
+| `hpc-jfetch 123456 ./downloads` | Save a private history archive locally. |
+| `hpc-jstorage-init` | Create the login-side shared-storage probe once. |
+| `hpc-jdoctor` | Check interpreter, Slurm, wrapper, storage, and probe. |
+
+Use exact array task IDs such as `123456_7`. Step IDs, array ranges, and
+heterogeneous allocations are rejected as arguments; step records remain in
+reports. Accounting searches default to 30 days; `--days N` accepts 1–3650.
+Scheduler queries are read-only, bounded, timeout-limited, and scoped to your
+authenticated account on the local cluster. Failures retain available saved
+history with diagnostics.
+
+Doctor reports accounting storage as `available`, `disabled`, or `unknown`
+using a bounded one-minute accounting query, rather than help/version output.
+Without accounting storage, completed jobs depend on previously collected
+history; live queue reports still work.
+
+Submit jobs normally with `sbatch`. Reporting and watching never start or stop
+collection. No helper implicitly deploys, submits jobs, starts a login-node
+daemon, or deletes history.
 
 ## Configure the remote environment
 
-Create this file **on the cluster login node**, at `~/.config/jobmon/env.sh`.
-The deployment helper does not create or copy it. From a cluster terminal:
-
-```bash
-mkdir -p "$HOME/.config/jobmon"
-chmod 700 "$HOME/.config/jobmon"
-micro "$HOME/.config/jobmon/env.sh"
-```
-
-Use another editor if `micro` is unavailable. For the first CPU-only test, save:
+On the cluster, create `~/.config/jobmon/env.sh` using
+[examples/env.sh](examples/env.sh) as a template. Minimal CPU-only settings:
 
 ```sh
-#!/bin/sh
-# Use an existing Python 3.8+ interpreter.
 export JOBMON_PYTHON="${JOBMON_PYTHON:-python3}"
-
-# This absolute directory must be shared by the login node and every compute node.
 export JOBMON_DATA_DIR="${JOBMON_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/jobmon}"
-
-# Sampling period used by the batch wrapper, in seconds.
 export JOBMON_INTERVAL="${JOBMON_INTERVAL:-60}"
 ```
 
-The default data directory is appropriate only if that location is shared.
-Otherwise, replace it with an absolute site shared-storage path. Relative
-`JOBMON_DATA_DIR` values are rejected instead of being resolved differently on
-login and compute nodes.
-The `${VARIABLE:-default}` form preserves an existing per-job override.
-Use `export` so Python and collector subprocesses receive the settings.
+Keep the directory mode 700 and file mode 600; check syntax with
+`sh -n "$HOME/.config/jobmon/env.sh"`. The file must be quiet and POSIX-compatible,
+with no output or collector startup. Put any required quiet site-module setup
+before the exports. An existing environment's Python can be invoked directly;
+`JOBMON_PYTHON` is one executable name or absolute path, without arguments, and
+must work on login and compute nodes.
 
-Check the existing interpreter on the cluster:
+The SSH helper, deployment preflight, wrapper, and optional interactive function
+source this file. Source it yourself before direct Python commands.
+The `${VARIABLE:-default}` form preserves per-job overrides.
 
-```bash
-command -v python3
-python3 --version
+| Remote setting | Default | Meaning |
+| --- | --- | --- |
+| `JOBMON_PYTHON` | `python3` | Existing Python 3.8+ executable. |
+| `JOBMON_DATA_DIR` | `${XDG_STATE_HOME:-$HOME/.local/state}/jobmon` | Absolute private directory shared at the same path on login and all compute nodes. |
+| `JOBMON_INTERVAL` | `60` | Sampling seconds, 1–86400; fractions accepted. |
+| `JOBMON_GPU_UUIDS` | Unset | Unique, comma-separated full `GPU-…` UUIDs verified for this allocation and node. |
+| `JOBMON_GPU_EXCLUSIVE` | Disabled | Assert verified exclusive GPU use without sharing, MPS, or MIG. |
+| `JOBMON_ALLOW_OVERLAP` | `0` | Enable site-validated multi-node collection. |
+| `JOBMON_PROCESS_TREE` | Disabled | Enable approximate process-group sampling where no job cgroup exists. |
+| `JOBMON_COLLECTOR` | `$HOME/.local/libexec/jobmon/collect.py` | Advanced wrapper-only override; must exist on every relevant node. |
+
+The three switches enable behavior only for the exact value `1`; use `0` to
+disable them. Other unset or empty settings use their defaults.
+`JOBMON_INTERVAL` is fixed when a job starts and differs from watch refresh
+`--interval`; direct collector invocations use their own `--interval`.
+
+The data directory must be shared, owned by you, and private: directories 700,
+files 600, with no symlinks for trusted state. Relative paths are rejected;
+`XDG_STATE_HOME` must also be absolute when used as the fallback. After
+deployment, run these on the workstation:
+
+```zsh
+hpc-jstorage-init
+hpc-jdoctor
 ```
 
-You can replace the `python3` default in the file with the absolute executable
-path returned above, provided that path also exists on the compute nodes.
-An existing Conda/Miniforge environment's Python can be invoked directly without
-interactive activation. If site modules are required, put the minimum quiet,
-noninteractive-compatible setup before the exports. No package installation is
-required. Avoid Bash-only syntax: SSH also sources this file from a POSIX shell.
+Initialization writes a login-side probe that every allocation must see;
+collectors also check visibility of the run directory. This detects missing
+shared storage, without certifying filesystem behavior. A failed probe disables
+monitoring while allowing the workload to run. Node-local spooling is unsupported.
 
-After saving the file, check its syntax, permissions, and interpreter. The final
-command assumes the three jobmon Python files have already been deployed:
+Start with one short CPU-only job and leave GPU settings unset. Set GPU UUIDs
+per allocation and node after verification, rather than retaining an old list in
+global configuration. The wrapper supplies `JOBMON_RUN_DIR`; Slurm supplies
+`SLURM_*` and `SLURMD_NODENAME`.
 
-```bash
-chmod 600 "$HOME/.config/jobmon/env.sh"
-sh -n "$HOME/.config/jobmon/env.sh"
-. "$HOME/.config/jobmon/env.sh"
-"$JOBMON_PYTHON" --version
-"$JOBMON_PYTHON" "$HOME/.local/libexec/jobmon/jobmon.py" storage-init
-"$JOBMON_PYTHON" "$HOME/.local/libexec/jobmon/jobmon.py" doctor
-```
+Workstation settings belong in your private Zsh configuration:
 
-Alternatively, back on the workstation run `hpc-jstorage-init` once and then
-`hpc-jdoctor`. Storage initialization creates a private marker on the login node.
-Every monitored allocation must see that marker before it creates a run, which
-detects a node-local path. Other allocation nodes must also see the batch node's
-new run directory before their collectors can start. A missing probe disables
-monitoring but does not change the scientific workload's exit status.
+| Local setting | Meaning |
+| --- | --- |
+| `HPC_JOBMON_HOST` | Required SSH destination; no default. |
+| `HPC_JOBMON_TOOLS_DIR` | Optional clone path for deployment. Normally inferred from the sourced helper, resolving symlinks. |
 
-Keep `env.sh` quiet: no `echo`, watchers, or collector startup commands. Source
-it explicitly before direct Python commands; the SSH helper, interactive
-`jobmon` function, deployment preflight, and batch wrapper source it themselves.
+History range, JSON output, watch refresh/count, and completion stopping are
+command options, rather than remote environment settings.
 
-### All supported remote jobmon settings
+## Add persistent collection
 
-The eight jobmon-specific inputs currently read by the remote shell integration
-and collector are listed below. Defaults apply when a setting is unset or empty,
-except the three switches, which enable their behavior only for the exact value
-`1`; use `0` to leave them disabled.
-
-| Setting                | Default                                        | Meaning and supported values                                                                                                                                                                                                                                                                                            |
-| ---------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `JOBMON_PYTHON`        | `python3`                                      | Existing Python 3.8+ interpreter, as one executable name or absolute path. No command-line arguments. Used by shell helpers and the batch wrapper.                                                                                                                                                                      |
-| `JOBMON_DATA_DIR`      | `${XDG_STATE_HOME:-$HOME/.local/state}/jobmon` | Absolute private shared history directory visible at the same path on login/compute nodes. Relative configured paths are rejected. Directories must be owned by you and mode 700.                                                                                                                                       |
-| `JOBMON_INTERVAL`      | `60`                                           | Collection period in seconds, between 1 and 86400; fractions are accepted. The batch wrapper passes it to `collect.py run --interval`. It does not change watch refreshes, and direct collector invocations use their own `--interval` argument.                                                                        |
-| `JOBMON_GPU_UUIDS`     | Unset; GPU collection off                      | Comma-separated, unique, full `GPU-…` UUIDs that you have verified belong to the allocation on that node. Numeric ordinals and MIG UUIDs are unsupported.                                                                                                                                                               |
-| `JOBMON_GPU_EXCLUSIVE` | Disabled                                       | `1` asserts verified exclusive use without sharing/MPS/MIG; supported device utilization may then be attributed to the job. `0` keeps shared-device context. Detected MIG prevents exclusive attribution even when set to `1`.                                                                                          |
-| `JOBMON_ALLOW_OVERLAP` | `0`                                            | `1` enables the example wrapper's multi-node `srun --overlap` monitor step after site validation. With `0`, a multi-node workload still runs but collection is skipped with a diagnostic. Single-node collection is unaffected.                                                                                         |
-| `JOBMON_PROCESS_TREE`  | Disabled                                       | `1` enables approximate process-group sampling where Slurm creates no job cgroup. Scope is the collector's own process group, so the workload must run directly in the batch script; `srun`/`mpirun` steps and anything calling `setsid`/`setpgid` are not counted. `0` keeps CPU and memory unavailable with a reason. |
-| `JOBMON_COLLECTOR`     | `$HOME/.local/libexec/jobmon/collect.py`       | Optional collector script path used by the batch wrapper for init/run/stop/finish. It must exist on every relevant node. It does not relocate the SSH report entry point.                                                                                                                                               |
-
-The expanded `remote-tools/examples/env.sh` template includes all eight inputs,
-with the advanced overrides commented out. Leave the GPU settings unset for
-your first CPU-only test. GPU UUIDs generally differ by node and allocation;
-set them in a validated per-node launch environment rather than keeping an old
-job's GPU list in a global configuration file.
-
-`XDG_STATE_HOME` is an existing system setting used only as a storage fallback
-when `JOBMON_DATA_DIR` is absent. Prefer configuring `JOBMON_DATA_DIR` directly.
-Do not set `JOBMON_RUN_DIR` in this file: the wrapper creates and exports it for
-each run. Slurm supplies `SLURM_*` and `SLURMD_NODENAME`; do not invent those
-values to enable collection outside an allocation.
-
-### Local helper settings and command options
-
-These settings belong in your **workstation's zsh environment**, not the
-cluster's `env.sh`:
-
-| Setting                | Default                                          | Meaning                                                                                                                                                       |
-| ---------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `HPC_JOBMON_HOST`      | Unset by the canonical helper                    | SSH destination for job monitoring and deployment: an `~/.ssh/config` alias or `user@login-host`. Set it in a private local configuration or managed shell module. |
-| `HPC_JOBMON_TOOLS_DIR` | The clone containing the sourced `jobmon.zsh`    | Repository used by `hpc-jdeploy`. Set it only when the helpers are not sourced from a clone. Reporting does not need this directory.                          |
-
-Watch refresh rate, history range, JSON output, watch refresh count, and stopping
-after a collected run finishes are
-command options, not `env.sh` toggles: use `hpc-jwatch JOB_ID --interval 5`,
-`hpc-jreport JOB_ID --days 90 --json`, or
-`hpc-jwatch JOB_ID --count 3`. To stop after the newest saved run has a workload
-exit and all expected final samples, use `hpc-jwatch JOB_ID --exit-on-completion`.
-
-## Add persistent collection to a batch script
-
-### Submission requirement
-
-Jobmon does not attach a collector when `hpc-job` or `hpc-jwatch` is run. Those
-commands only read scheduler information and collector files that already exist.
-For persistent CPU and memory samples, the submitted batch allocation must start
-the workload through `monitored-job.sh`.
-
-`hpc-jdeploy --apply` installs the Python entry points and this wrapper as a
-single verified release. The cluster-side executable symlink is:
-
-```text
-~/.local/bin/monitored-job.sh -> ../libexec/jobmon/current/monitored-job.sh
-```
-
-For an existing installation, rerun `hpc-jdeploy`, review the preview, then run
-`hpc-jdeploy --apply` and `hpc-jdoctor`. No separate `scp` step is needed. The
-wrapper must be accessible from the allocation nodes along with the Python
-files. Installing it starts no collector and changes no submitted job scripts.
-
-An existing byte-identical manual copy is migrated to this managed symlink.
-Deployment refuses to overwrite a modified file, directory, or unrelated
-symlink at that path; review and move it aside yourself before retrying. Keep
-local wrapper customizations at a separate path. Existing `~/.local/bin`
-permissions are preserved; the installed wrapper has mode 700.
-
-The same rule protects the `~/.local/libexec/jobmon/*.py` entry points: a
-byte-identical manual copy is migrated to the managed symlink, and anything else
-found at those paths is reported and left alone. On a first installation
-`current` is activated before the entry points are linked, so an interrupted
-deployment never leaves links pointing at a release that does not exist.
-Managed Python links must have the relative target `current/FILENAME`, and
-`current` must point directly to a release under `releases/`. Other symlink
-targets, including dangling unrelated links, are refused before activation.
-
-For a simple batch script with one workload command, keep the existing Slurm
-directives and launcher, but place the wrapper around the command:
+A submitted batch script must launch the workload through the deployed wrapper
+to save samples. A job submitted without it still has scheduler reports.
+Keep existing Slurm directives and the application's required launcher:
 
 ```bash
 #!/usr/bin/env bash
@@ -383,221 +219,108 @@ directives and launcher, but place the wrapper around the command:
 #SBATCH --time=00:30:00
 
 set -euo pipefail
-
-# Keep the launcher your application already requires. Do not add srun solely
-# for jobmon.
-bash "$HOME/.local/bin/monitored-job.sh" \
-  srun your-application its-arguments
+bash "$HOME/.local/bin/monitored-job.sh" srun your-application its-arguments
 ```
 
-Submit it normally:
+Submit with `sbatch example.sbatch`. Do not add `srun` solely for monitoring.
+With a verified job cgroup, retain the existing launcher. The process-group
+fallback instead requires a direct workload, without separate `srun`/MPI steps.
 
-```bash
-sbatch example.sbatch
-```
-
-For a complex script that performs environment setup, creates per-job log
-directories, runs several commands, or records postprocessing results, wrap the
-remainder of the script once by re-entering the same script. Place this block
-after the persistent log directory exists but before environment setup or
-scientific work begins:
+For a multi-command script, define a persistent `RESULT_DIR`, then re-enter the
+script once through the wrapper. Place this before environment setup and work:
 
 ```bash
 mkdir -p "$RESULT_DIR"
-
-# Redirect before jobmon starts so collector diagnostics are retained too.
 if [[ ${JOBMON_WRAPPED:-0} != 1 ]]; then
   exec > "$RESULT_DIR/job.out" 2> "$RESULT_DIR/job.err"
   export JOBMON_WRAPPED=1
-  exec bash "$HOME/.local/bin/monitored-job.sh" \
-    bash "${BASH_SOURCE[0]}"
+  exec bash "$HOME/.local/bin/monitored-job.sh" bash "${BASH_SOURCE[0]}"
 fi
 unset JOBMON_WRAPPED
 
-# Environment setup and all workload/postprocessing commands follow here.
+# Environment setup, workload, and postprocessing follow.
 ```
 
-The first invocation creates the logs and replaces itself with the wrapper. The
-wrapper starts the allocation-local collector and invokes the same batch script
-again. The inherited marker prevents recursion, while the wrapper retains the
-final script exit status and stops the collector during cleanup.
+Redirecting first retains monitor diagnostics. Use another marker name if
+`JOBMON_WRAPPED` conflicts with your script, and do not export it at submission.
+The long-running work must remain the wrapper's child. Slurm copies scripts at
+submission: changes require a new submission and cannot retrofit pending or
+running jobs. Each array task collects separately.
 
-Use a project-specific marker name if the script already uses `JOBMON_WRAPPED`.
-Do not pass that marker with `sbatch`, and do not place the wrapper around only a
-short setup command—the long-running workload must remain its child. Slurm copies
-the batch script when it is submitted, so editing the source file cannot add
-monitoring to an already running or pending job; submit a new job after making
-this change.
+The wrapper creates a unique run with a restart label, waits up to ten seconds
+for the first sample, and runs the workload even if monitoring fails. It
+preserves arguments, stdin (including closed stdin), and workload exit status.
+One collector per node uses an advisory lock and a separate, flushed JSONL
+stream per collector start; the shared filesystem must support advisory locks.
+Never start collectors on the login node.
 
-For a job array, each task starts its own collector and history. Query each task
-with its exact ID, such as `123456_7`. Once a task is running, use these commands
-on the workstation, not inside the allocation:
+SIGTERM, SIGINT, and SIGHUP reach the launcher and visible local descendants.
+The wrapper waits for shutdown without cutting off checkpoint handlers, forwards
+further signals to survivors, and reports the first interruption as 143, 130,
+or 129 respectively. Detached/reparented processes fall outside that tree; use
+the workload's launcher to manage remote processes. SIGKILL and node loss cannot
+guarantee final records. Monitoring failures and interruptions during bounded
+monitor cleanup preserve the workload's recorded result.
 
-```zsh
-hpc-job 123456_7
-hpc-jwatch 123456_7 --interval 5
-```
+Multi-node collection stays disabled until you validate the site's overlapping
+steps and binding. With `JOBMON_ALLOW_OVERLAP=1`, the wrapper launches one
+`srun --overlap` monitor task per node, requesting one CPU and 64 MiB per node.
+Without opt-in, the workload runs with a missing-coverage diagnostic.
 
-If the cluster exposes a verified job cgroup, retain the application's existing
-`srun` or MPI launcher. If no job cgroup exists and
-`JOBMON_PROCESS_TREE=1` is deliberately enabled, the workload must instead run
-directly under the wrapper: separate `srun`/MPI steps and programs that create a
-new process group are outside that approximation and will be reported as
-uncounted.
+## Watch saved history
 
-Choose an absolute private storage directory **shared by login and every compute node**.
-Set `JOBMON_DATA_DIR` in the remote environment file. Its default is
-`${XDG_STATE_HOME:-$HOME/.local/state}/jobmon`, which is useful only if that path
-is shared. Run `hpc-jstorage-init` from the workstation before the first monitored
-job. The login-created probe and allocation-side checks catch missing visibility;
-they do not benchmark or certify the filesystem. Node-local spooling/persistence
-is not implemented.
+Watch takes one scheduler snapshot over one SSH connection, then incrementally
+reads saved samples. It does not keep polling Slurm. Rerun `hpc-jreport` for
+updated accounting. Without saved history, watch prints a one-shot report and
+diagnostic. Ctrl-C stops the viewer while collection continues.
 
-The wrapper creates a unique run record (including a requeue/restart label),
-starts collection, waits up to ten seconds for the first sample, then runs and
-waits for your workload. It preserves stdin, including a deliberately closed
-file descriptor 0, arguments, and the workload exit status.
-Monitoring initialization, sampling, or cleanup failures do not change
-that status. The workload retains normal SIGINT handling and stays in the batch
-process group, including when monitoring fails. SIGTERM, SIGINT, and SIGHUP are
-forwarded to the launcher and its visible local descendants; the wrapper waits
-for them to stop before recording completion. Further signals reach surviving
-processes during that wait, and the wrapper reports the first interruption as
-143, 130, or 129 respectively. No forced shutdown timeout cuts short a workload's
-checkpoint handler. Processes already detached and reparented are outside that
-tree; use a launcher such as `srun` to manage remote processes. SIGKILL and node
-loss cannot guarantee cleanup or completion records. Once the workload finishes,
-interruptions during the bounded monitor shutdown preserve its recorded exit
-status.
+Without an ID, an interactive picker lists running/completing jobs by ID and
+shortened name: use arrows or `j`/`k`, Enter to select, and `q`, Esc, or Ctrl-C
+to cancel (status 130). One running job is selected automatically; other jobs
+are counted but excluded. Options apply to the selection. The picker adds one
+SSH connection; noninteractive use requires an explicit ID.
 
-Collection defaults to 60 seconds; set `JOBMON_INTERVAL` to change it. A shorter
-interval catches briefer memory spikes in the sampled peak and makes `CPU LAST`
-react faster, at the cost of more records; process-tree sampling has no kernel
-high-water mark to fall back on. An `env.sh` copied from an earlier example may
-still pin `JOBMON_INTERVAL` to 30; edit or remove that line to use the default.
-The interval is fixed when a job starts, so running jobs keep theirs. There is
-one collector per node, protected by an advisory lock, with a separate JSONL
-stream for every collector start. Samples are flushed as they are written.
-The shared filesystem must support advisory locks. Files are mode 600 and
-directories mode 700; existing broadly readable storage is rejected.
+The title shows `Job 123456 (simulation)`. Names come from the initial queue,
+then latest accounting, then newest named saved run; new runs record
+`SLURM_JOB_NAME`. Older history remains readable, with `name unavailable` when
+needed. Names stay fixed during a watch and text output escapes control characters.
 
-For multiple nodes, the example requires explicit `JOBMON_ALLOW_OVERLAP=1` after
-testing site support. It launches one monitor task per allocated node using
-`srun --overlap`, one CPU per task and 64 MiB per node. Adapt this launcher to
-site policy and verify application/GPU binding. Without opt-in, the scientific
-workload runs and the report marks the missing collector coverage. There is no
-separate queued monitor job or persistent login-node collection daemon.
+Text watch prints its snapshot, diagnostics, and run scope once, then a row only
+when a new sample arrives. A five-second refresh stays quiet between 60-second
+samples. New collection errors appear once.
 
-## Watch and fetch history
+| Column | Meaning |
+| --- | --- |
+| `CLOCK` | Sample capture time using the workstation's UTC offset at startup; direct cluster use shows cluster local time. |
+| `ELAPSED` | Runtime inferred from the initial Slurm snapshot; falls back to monitoring start when unavailable, as labelled. |
+| `CPU LAST / AVG / MAX` | Latest interval, covered-interval average, and busiest interval, as percentages of allocated cores. |
+| `MEMORY / MEMORY MAX` | Current and largest sampled memory readings. |
+| `NODE` | Added for multi-node runs. |
 
-```zsh
-hpc-jwatch 123456 --interval 5
-hpc-jwatch --interval 5                 # no ID: choose from your running jobs
-hpc-jwatch 123456 --interval 5 --json   # newline-delimited JSON snapshots
-hpc-jwatch 123456 --exit-on-completion # stop after workload exit and final samples
-hpc-jfetch 123456 ./downloads
-```
+A stall produces one warning after `max(2.5 × interval, interval + 30 s)`.
+Final samples are marked `final` and stop stall warnings for that node.
+Wrapper completion reports exit code 0 as success, nonzero exits with a log
+hint, and final-node counts that update as delayed samples arrive. Unknown or
+incomplete node layouts remain explicit. Once all expected final samples arrive,
+watch prints sampled CPU average and memory peaks once; multi-node peaks stay
+separate per node.
 
-Without a job ID, `hpc-jwatch` lists your running jobs and lets you choose one:
-`j`/`k` or the arrow keys move, Enter watches the highlighted job, and `q`, Esc,
-or Ctrl-C cancel with status 130. Options such as `--interval` still apply to
-the chosen job. Only running jobs are listed, since a pending job has no samples
-yet; the title counts the others. With exactly one running job, it is watched
-without a menu. The menu is drawn on the terminal and erased before watching
-starts, a long list scrolls, and the terminal's settings are restored on every
-exit. Outside an interactive terminal, such as in a script, a job ID is still
-required and nothing connects without one. Choosing costs one extra SSH
-connection for the job list.
+Watch remains open for later requeued runs by default. `--exit-on-completion`
+stops when the newest visible saved run has a wrapper completion record and
+all expected nodes' final samples, including if already complete at startup.
+Older runs cannot stop a newer active run. Missing finals or unknown layouts
+keep it open; the option neither waits for future requeues nor establishes final
+Slurm state. Viewer exit status is 0 even when the workload exited nonzero.
 
-Watch uses one SSH connection, takes one scheduler snapshot, and then reads
-new sample records incrementally. Ctrl-C stops only the viewer. Run a new
-`hpc-jreport` to refresh final accounting. A job without saved history gets a
-one-shot report and a diagnostic instead of a scheduler polling loop.
+`--count N` limits refreshes, including those without new samples.
+`--json` emits a complete JSON snapshot on every refresh; completion stopping
+emits the final snapshot before closing, without extra text.
 
-The text view states everything that cannot change during the watch once: the
-scheduler snapshot and the time it was taken, site diagnostics, and for each run
-its nodes, sampling interval, measurement scope, and what is not measured. After
-that it prints a row only when a node delivers a new sample, so a 5-second
-refresh against 60-second sampling stays quiet in between. For example:
+## Fetch and read offline
 
-```text
-CLOCK        ELAPSED  SAMPLES  CPU LAST 60 s    CPU AVG    CPU MAX       MEMORY   MEMORY MAX
-11:25:29     7:26:31      447         101.2%      43.4%     101.2%    27.37 GiB    27.37 GiB
-11:26:29     7:27:31      448         101.8%      43.5%     101.8%    27.37 GiB    27.37 GiB
-11:27:29     7:28:31      449          98.0%      43.5%     101.8%     2.01 GiB    27.37 GiB
-11:30:12  no new sample for 163 s (expected every 60 s)
-```
-
-- `CLOCK` is when each sample was taken, in your workstation's time zone:
-  `hpc-jwatch` sends its UTC offset, so the times match your clock even when the
-  cluster runs in another zone. Run directly on the cluster, watch uses the
-  cluster's local time. The header names the zone either way.
-- `ELAPSED` is the job's run time at that sample, laid out like squeue's `TIME`
-  column, which is also elapsed time rather than a time of day. It counts from
-  the start Slurm implies at the scheduler snapshot (snapshot time minus Slurm's
-  elapsed). When Slurm has no running record for the run, for example after the
-  job ends, it counts from when monitoring started instead, and the run header
-  says so.
-- CPU columns are a percentage of the node's allocated cores. `CPU LAST` covers
-  only the newest sampling interval, so a ramp-up shows at once; `CPU AVG` covers
-  every sampled interval so far; `CPU MAX` is the busiest single interval so
-  far. Busy-core counts appear in `hpc-jreport` and `hpc-job`.
-- `MEMORY` is the newest sampled reading and `MEMORY MAX` the largest sampled
-  reading so far, so a peak stays visible after memory drops.
-
-Multi-node runs add a `NODE` column. A node that misses about two and a half
-sampling intervals, at least 30 seconds past its interval, produces one warning
-per stall rather than a growing age on every refresh. A final sample is marked
-`final` and produces no further stall warnings for that node. When the wrapper
-records completion, the watch distinguishes a successful workload exit (`0`)
-from a nonzero exit and points to application logs when needed. It reports
-final samples as node counts, such as `1/2 nodes; waiting for final samples`, and
-updates the count as delayed samples arrive. An incomplete expected-node layout
-is named explicitly, even if the number of observed final samples matches the
-declared node count.
-
-Once all expected nodes have final samples, the watch prints the CPU average
-over sampled intervals and the sampled memory peak once. For multiple nodes,
-memory peaks are listed separately per node; they are not a concurrent total.
-Unavailable measurements remain unavailable. A synthetic completion example:
-
-```text
-11:28:02  Workload finished with exit code 1 (nonzero).
-11:28:02  Final samples: 1/1 node recorded.
-          CPU average (sampled intervals): 43.5% of allocated cores
-          Sampled memory peak: 27.37 GiB
-          Check application logs; run hpc-jreport 123456 for final Slurm status.
-          Watch remains open; press Ctrl-C to stop viewing.
-```
-
-The workload exit comes from the batch wrapper; final Slurm status still needs
-a fresh `hpc-jreport`. Watching stays open by default so later requeued runs can
-appear. Add `--exit-on-completion` to stop when the newest run currently visible
-in saved history has both a wrapper completion record and final samples from
-every expected node. Older completed runs cannot stop a watch of a newer active
-run. The option also stops immediately if that newest saved run is already
-complete when watching starts; it does not wait for a future requeue and does
-not establish a final scheduler state.
-
-Missing final samples or an unknown node layout leave the watch open. `--count N`
-still stops after N refreshes, whether or not samples arrived, so it can bound
-the wait; Ctrl-C also stops viewing. A normal automatic stop returns viewer exit
-status `0`, including when the recorded workload exit is nonzero. New collection
-errors are printed when they first appear.
-
-`--json` keeps the same report format: every refresh emits one complete JSON
-snapshot, for scripts that parse the stream. `--exit-on-completion` also works
-with it, emitting the final snapshot before closing without extra text.
-
-Only run directories are read as saved history. An unrelated entry beside them,
-such as the `.nfs` stub shared storage leaves behind when an open file is
-deleted, is listed under `ignored_storage_entries` and skipped; it does not stop
-a report or a fetch. A symlink where a run directory belongs is still refused.
-
-Fetch writes a private `.tar.gz` archive to the required local directory. It
-does not extract files automatically. Failed transfers preserve a `.partial`
-file and the SSH/remote exit status. Live archives can end with a partial JSONL
-line; readers wait for or ignore that unfinished record. To inspect offline:
+`hpc-jfetch 123456 ./downloads` writes a private `.tar.gz` without extracting it.
+Failed transfers retain a `.partial` file and the SSH/remote exit status.
+Live archives may end in an unfinished JSONL record, which readers skip or await.
 
 ```sh
 umask 077
@@ -606,226 +329,144 @@ tar -xzf downloads/jobmon-123456.EXAMPLE.tar.gz -C saved-history
 JOBMON_DATA_DIR="$PWD/saved-history" python3 jobmon/jobmon.py report 123456 --json
 ```
 
-Offline reads verify directory/file ownership and saved job/run metadata.
-They report unavailable scheduler queries without discarding the samples.
-An array fetched with `123456_7` must be read using the same task ID.
-The report reader currently requires the metadata username and UID to match
-the reading account. If your local and remote accounts differ, inspect the
-archived JSON/JSONL files directly or generate reports on the cluster; keep
-the original ownership metadata intact.
+Offline reports retain samples when scheduler commands are unavailable. Ownership,
+permissions, and metadata are checked; saved username and UID must match the
+reading account. If accounts differ, inspect raw JSON/JSONL or report on the
+cluster, preserving original metadata. Use the exact fetched array task ID.
 
-## Troubleshooting
-
-- If every `hpc-*` command fails at once with SSH exit status 255 and
-  `Permission denied`, the login needs a password or second factor, which batch
-  mode never prompts for. Load your key into `ssh-agent`, or share one interactive
-  login as described in [Password and two-factor logins](#password-and-two-factor-logins).
-- If `hpc-jdeploy` reports that it cannot find `shell/deploy-jobmon.sh`, the
-  helpers were not sourced from a clone of this repository. Source
-  `shell/jobmon.zsh` from your clone, or set `HPC_JOBMON_TOOLS_DIR` to it.
-- If `hpc-jdeploy --apply` fails during checksum, Python compilation, or wrapper
-  Bash syntax validation, the old
-  `current` release remains active. Check that `env.sh` is quiet and that
-  `JOBMON_PYTHON` works in a noninteractive POSIX shell.
-- To roll back, log in to the cluster, choose a hash shown by
-  `ls ~/.local/libexec/jobmon/releases`, verify its `SHA256SUMS`, create a new
-  relative symlink to `releases/HASH`, and replace `current` with `mv -fT`.
-  The Python entry points and wrapper link follow `current`. Choose a release
-  containing `monitored-job.sh` to retain the managed wrapper; older Python-only
-  releases leave that wrapper link dangling.
-- If `hpc-jdoctor` reports a missing or non-executable batch wrapper, rerun
-  `hpc-jdeploy --apply`. Its `batch_wrapper` result includes the path and
-  existence/executable checks. Resolve any wrapper path conflict as described
-  in the submission section before retrying.
-- If `hpc-jdoctor` reports a missing storage probe, confirm that
-  `JOBMON_DATA_DIR` is the intended absolute shared path and rerun
-  `hpc-jstorage-init` from the workstation, not from an allocation.
-- If a monitored workload runs but no history appears, read the batch stderr.
-  The wrapper deliberately continues after monitoring setup fails. Typical
-  causes are an invisible storage probe, an unreadable collector, or a site
-  module unavailable on compute nodes.
-- If CPU or memory samples say that no verified job cgroup is visible, the site
-  may use cgroup v1, a cgroup namespace, or a path shape this collector does not
-  support. Scheduler accounting reports still work. Check the site's plugins with
-  `scontrol show config | grep -iE 'ProctrackType|TaskPlugin|JobAcctGatherType'`.
-  If `ProctrackType` is `proctrack/pgid` and `TaskPlugin` is `task/none`, Slurm
-  creates no job cgroup in any version and no cgroup reader can help; set
-  `JOBMON_PROCESS_TREE=1` for approximate process-group sampling instead. Note
-  that `task/none` also means allocated cores are not enforced, so a job can use
-  more cores than it requested.
-- If process-tree samples report far less CPU than the job is using, the work is
-  leaving the batch process group. Run the workload directly in the batch script
-  rather than through `srun`, and avoid wrappers such as GNU `timeout` that place
-  the child in a new process group.
-- If a report says that Slurm accounting storage is disabled, the site runs
-  without an accounting database. `sacct` then fails for every job, so completed
-  jobs cannot be reported from the scheduler and a larger `--days` cannot help.
-  `hpc-jdoctor` shows this as `"accounting_storage": "disabled"`. `hpc-jobs`,
-  queued/running reports, and `sstat` live steps are unaffected; wrap future
-  jobs with the collector to retain usage after they finish.
-- If `hpc-jreport` cannot find an older completed job, increase `--days`. If
-  Slurm accounting is unavailable but private history exists, the report keeps
-  the saved samples and includes the scheduler error.
-- If `hpc-jfetch` fails, its `.partial` file is retained deliberately. Remove it
-  only after diagnosing the SSH or remote error.
+Unrelated entries beside run directories, including `.nfs` files, are skipped
+and listed under `ignored_storage_entries`; symlinked run directories are refused.
+Keep archives in ignored `downloads/` or outside the repository. There is no
+automatic telemetry deletion; removing the wrapper from future scripts stops
+future collection.
 
 ## What measurements mean
 
-- CPU accounting efficiency is parent `TotalCPU / (ElapsedRaw × AllocCPUS)`.
-  Parent and child CPU totals are never added. The percentage assumes a fixed
-  allocation; zero `TotalCPU` is treated as ambiguous accounting, not proof of
-  an idle job. Accounting may arrive late or omit CPU time after signals.
-- Accounting `MaxRSS` is a maximum associated with a task inside a step, not
-  whole-job memory. Memory requests preserve per-CPU/per-node semantics; reports
-  do not invent a percentage when allocation data is missing. A request Slurm
-  reports in an unreadable form has scope `unavailable`, never a per-CPU or
-  per-node label guessed from its trailing character.
-- Where Slurm creates no job cgroup at all, `JOBMON_PROCESS_TREE=1` enables a
-  fallback that sums `utime`, `stime`, `cutime`, and `cstime` from `/proc` across
-  the collector's own process group, plus each member's RSS. It is labelled
-  `process_tree_pgid` and is an **approximation**, never presented as a cgroup
-  measurement. Reaped children are counted through the parent's `cutime`, so the
-  total stays monotonic, but four accuracy limits remain: work in a
-  separate Slurm step (`srun`, `mpirun`), any process that calls `setsid` or
-  `setpgid` (GNU `timeout` does this unless given `--foreground`), processes
-  orphaned to `init`, and summed RSS double-counts pages shared between
-  processes. A detected launcher in the group is reported as an explicit
-  understatement warning rather than silently lowering the number. The collector
-  excludes itself. An empty group reports unavailable, never zero.
-- Collection uses a visible cgroup v2 `job_<raw job ID>` ancestor of the
-  collector, discovered from `/proc`. If no such boundary is visible, CPU/memory
-  remain unavailable with a reason unless `JOBMON_PROCESS_TREE=1` explicitly
-  enables the process-group approximation described above. Cgroup v1 collection
-  is unsupported. Cgroup memory charges include cache and are not RSS.
-- Two memory peaks are reported per node and never mixed. The _sampled peak_ is
-  the largest `memory.current` an interval happened to observe, so a spike
-  between samples is invisible to it. The _kernel high-water mark_ is the
-  cgroup's own `memory.peak`, which is exact and independent of the sampling
-  interval, but is lifetime-cumulative and cannot be aligned across nodes, so it
-  is never used for a concurrent total. `memory.peak` needs cgroup v2 on Linux
-  5.19 or newer; where it is absent the mark reports as unavailable with that
-  reason rather than falling back to the sampled value. Process-tree sampling
-  has no kernel high-water mark at all, and says so instead.
-- Concurrent memory peaks require a valid reading from every expected node,
-  within half the shortest sampling interval. The expected node list must be
-  known and match the declared node count, when available. An incomplete layout
-  retains per-node readings, but concurrent totals remain unavailable and
-  `all_expected_collectors_final` stays false, even if every known collector
-  recorded its final sample. Independent node peaks are
-  reported separately, and on a one-node run, where all of these are the same
-  reading, the text report shows only the node's own. Clock synchronization is
-  assumed. CPU percentages use allocated core-time over covered intervals; gaps
-  are not filled with zeros.
-- Sample timestamps mark the start of CPU and memory capture, before optional
-  GPU queries. A slow GPU query does not shift the CPU/memory timestamp used for
-  cross-node alignment.
-- Watches retain up to 128 pending memory readings per node to align delayed
-  file appends. Recent concurrent peaks can be revised as delayed samples arrive;
-  completed time ranges remain accumulated without rereading the full history.
-  Exceeding the buffer, or receiving timestamps behind an already committed time
-  range, marks `concurrent_memory_alignment_incomplete` and adds a diagnostic.
-  Start a fresh report to recompute those alignments from the saved files. This
-  affects concurrent totals; independent node peaks remain available.
-- Each node reports CPU for its newest interval, the average over all sampled
-  intervals, and its busiest single interval, as a percentage of allocated cores
-  and as busy cores. The newest interval is unavailable, not zero, after a first
-  sample, a counter reset, or a gap longer than one and a half sampling
-  intervals; such intervals never count toward the average or the maximum. Where
-  Slurm does not enforce core limits (`TaskPlugin` is `task/none`, common on
-  process-tree sites), an interval can exceed 100% of allocated cores: that is
-  real use beyond the allocation, not a measurement error. Text output shows
-  memory in binary units (KiB, MiB, GiB); JSON output keeps exact bytes.
-- GPU sampling requires existing `nvidia-smi` and explicitly verified full
-  UUIDs in `JOBMON_GPU_UUIDS`, comma-separated. Numeric CUDA/Slurm ordinals are
-  never mapped by assumption. Without a mapping, GPU collection is off and the
-  report lists GPU under "Not measured". Only an allocation that Slurm or CUDA
-  shows holding GPUs also records a collection diagnostic explaining how to map
-  them. In multi-node jobs, provide UUIDs in a node-specific
-  launch environment; different nodes generally have different UUIDs.
-- GPU measurements default to shared-device context, with job utilization
-  unavailable. Set `JOBMON_GPU_EXCLUSIVE=1` only after verifying exclusive use
-  and absence of sharing/MPS/MIG. Detected MIG keeps measurements as context.
-  MIG UUID sampling is unsupported. GPU averages use covered device-time;
-  utilization is device activity, not a percentage of theoretical FLOPS.
-- Between samples the collector checks the `stop.json` marker every few seconds
-  rather than every second, so a long job on shared storage does not generate
-  steady metadata traffic. Signals are unaffected: `SIGTERM`, `SIGINT`, and
-  `SIGHUP` interrupt the wait immediately and still produce one final sample.
+Unavailable or stale data never becomes guessed zero usage. Reports retain raw
+scheduler records, distinct allocations and collected runs, scope, coverage,
+missing nodes, gaps, final status, and errors. Malformed samples are skipped with
+diagnostics without discarding valid records. Saved runs are not automatically
+matched to accounting restarts: compare raw IDs, submit/start times, and restart
+labels for requeues. Wrapper completion and final samples do not prove final
+scheduler state.
 
-Each JSON report includes raw scheduler records, distinct allocation records,
-separate collected runs, data sources, scope labels, missing nodes, gaps,
-latest timestamps, final-sample status, both the sampled and kernel high-water
-memory peaks per node, and collection errors. Saved runs are
-not automatically merged with a particular accounting restart: inspect raw
-IDs, submit/start timestamps, and restart labels when reconciling requeues.
-Missing final samples, stale data, and a wrapper completion marker do not by
-themselves establish a job's final scheduler state. Full-run GPU coverage is
-not asserted because the expected device set must be verified on each node.
-Malformed sample records are skipped with diagnostics before changing any
-aggregates; valid records in the same run remain readable.
+### Scheduler accounting
 
-## Files and validation
+CPU efficiency is parent `TotalCPU / (ElapsedRaw × AllocCPUS)`, assuming a fixed
+allocation. Parent and step totals are never added. Zero `TotalCPU` is ambiguous,
+and accounting can arrive late or omit CPU time after signals.
 
-The deployed program sources are `jobmon/jobmon.py`, `jobmon/slurm_backend.py`,
-`jobmon/collect.py`, and `examples/monitored-job.sh`. The installer packages those
-four files with `SHA256SUMS`, validates the archive remotely, byte-compiles the
-Python files with the configured interpreter, checks the wrapper with `bash -n`,
-and activates a content-addressed directory through `current`. Stable
-`~/.local/libexec/jobmon/*.py` and `~/.local/bin/monitored-job.sh` symlinks preserve
-the command paths. A failed
-preflight leaves the previously active `current` release unchanged.
+`MaxRSS` is a task maximum within a step, rather than whole-job memory.
+Requests retain per-CPU/per-node scope; missing or unreadable allocation data
+does not produce an invented percentage or scope.
 
-`shell/jobmon.zsh` stays local; `shell/deploy-jobmon.sh` is the explicit installer,
-run from a workstation over SSH or on the cluster with `--local`.
-`examples/env.sh` and `examples/bashrc.fragment` remain opt-in manual
-configuration; `examples/monitored-job.sh` is included in deployment. No real host aliases,
-usernames, telemetry, or storage paths are baked into sources. Keep fetched
-archives under `downloads/` or outside the repository; the provided `.gitignore`
-excludes that directory and common private local configuration files.
+### CPU and memory sampling
+
+Preferred collection uses a visible cgroup v2 `job_<raw job ID>` ancestor found
+through `/proc`. Cgroup v1 is unsupported. Without a verified boundary, CPU and
+memory stay unavailable unless the process-group approximation is enabled.
+Cgroup memory includes cache charges and is not RSS.
+
+`JOBMON_PROCESS_TREE=1` enables `process_tree_pgid` where no job cgroup exists.
+It sums the collector's process group, excluding itself, and includes reaped
+children's CPU time. Separate Slurm/MPI steps, `setsid`/`setpgid`, orphaned
+processes, and short-lived unsampled work can escape it; summed RSS double-counts
+shared pages. GNU `timeout` creates a new group unless given `--foreground`.
+Detected launchers produce an understatement warning; an empty group is
+unavailable, rather than zero. This scope is always labelled as approximate.
+
+CPU averages use allocated core-time over covered intervals. First samples,
+counter resets, and gaps longer than 1.5 sampling intervals leave the latest
+interval unavailable and are excluded from averages and maxima. Without core
+enforcement (for example `TaskPlugin=task/none`), real use can exceed 100%.
+Reports also show busy-core counts. Text uses binary memory units; JSON keeps bytes.
+
+The **sampled memory peak** is the largest observed reading and misses spikes
+between samples. A shorter interval improves resolution at the cost of more
+records. The separate **kernel high-water mark**, cgroup `memory.peak`, captures
+the lifetime peak independently of sampling, requires Linux 5.19+ with cgroup v2,
+and remains unavailable where unsupported. Process-group sampling has no kernel
+mark. Neither substitutes for the other.
+
+### Multi-node totals
+
+Concurrent memory needs valid readings from every expected node within half
+the shortest sampling interval, a complete node layout matching the declared
+count, and synchronized clocks. Independent node peaks and kernel high-water
+marks are never summed as concurrent usage. Incomplete layouts retain per-node
+readings, but concurrent totals are unavailable and
+`all_expected_collectors_final` remains false.
+
+Timestamps precede GPU queries, so slow GPU reads do not shift CPU/memory alignment.
+Delayed samples may revise concurrent peaks. If the watch's bounded alignment buffer
+overflows or data arrives behind a committed time range,
+`concurrent_memory_alignment_incomplete` is set with a diagnostic. A fresh report
+recomputes alignment from saved files; independent node peaks are unaffected.
+
+### GPU scope
+
+GPU sampling requires existing `nvidia-smi` and verified full `GPU-…` UUIDs
+for each allocation/node. Numeric ordinals and MIG UUIDs are unsupported.
+Without mapping, GPU sampling is off; visible allocations get a mapping diagnostic.
+
+Measurements default to shared-device context, with job utilization unavailable.
+Set `JOBMON_GPU_EXCLUSIVE=1` only after verifying exclusive use without sharing,
+MPS, or MIG; detected MIG still prevents exclusive attribution. Averages cover
+observed device-time, rather than claiming full-job coverage. Utilization measures
+device activity, not theoretical FLOPS.
+
+## Troubleshooting
+
+| Symptom | Action |
+| --- | --- |
+| SSH status 255 or permission denied | Load an agent key or [share an authenticated connection](#ssh-destination-and-authentication). |
+| Cannot find deployment script | Source the helper from the clone, or set `HPC_JOBMON_TOOLS_DIR`. |
+| Deployment preflight fails | Check quiet `env.sh`, interpreter, checksums, and Bash syntax; the previous release stays active. |
+| Deployment path conflict | Review the unrelated file/link and move it aside; keep custom wrappers at another path. |
+| Doctor finds no executable wrapper | Resolve path conflicts, then preview and apply deployment again. |
+| Missing storage probe | Check the shared data path; run `hpc-jstorage-init` on the workstation or direct `storage-init` on the login node. |
+| Workload runs without history | Read batch stderr for probe, collector-path, interpreter, or compute-node module errors. |
+| No verified cgroup | Check site plugins and cgroup visibility; consider the labelled process-group fallback only where appropriate. |
+| Process-group CPU is too low | Keep the workload in the batch process group; separate launchers/groups escape measurement. |
+| Accounting storage disabled | Completed jobs require saved history; a larger `--days` cannot help. |
+| Older job missing | Increase `--days` if accounting storage is available. |
+| Fetch left a `.partial` file | Diagnose the SSH/remote failure before removing it. |
+
+Inspect site plugins with
+`scontrol show config | grep -iE 'ProctrackType|TaskPlugin|JobAcctGatherType'`.
+Sites using `proctrack/pgid` with `task/none` create no job cgroup and do not
+enforce allocated core limits.
+
+For rollback, choose a retained release under
+`~/.local/libexec/jobmon/releases/`, verify its `SHA256SUMS`, create a temporary
+relative symlink to `releases/HASH`, and replace `current` with `mv -fT`.
+Choose a release containing `monitored-job.sh`; older Python-only releases leave
+the managed wrapper link dangling.
+
+## Development and validation
+
+See [AGENTS.md](AGENTS.md) for the repository map and contribution contracts.
+Run:
 
 ```sh
 python3 -m unittest discover -s tests -v
 zsh -n shell/jobmon.zsh
 bash -n shell/deploy-jobmon.sh
 bash -n examples/monitored-job.sh
+bash -n examples/env.sh
+bash -n examples/bashrc.fragment
 shellcheck shell/deploy-jobmon.sh examples/monitored-job.sh examples/env.sh examples/bashrc.fragment
 ruff check jobmon tests
 ```
 
-`.github/workflows/checks.yml` runs the same checks on push and pull request,
-with the unit suite on both the supported Python floor and a current release.
-The unit suite also exercises the workstation helpers, so local test runs need
-Bash and Zsh. Each Python CI job installs Zsh before running those transport and
-terminal tests; the separate shell job's installed tools are not shared with it.
+Tests use synthetic fixtures and fake SSH; no cluster is required. Local tests
+need Bash and Zsh, with Ruff and ShellCheck for linting. CI checks Python 3.8 and
+a current release. External dotfile tests run only when `REMOTE_HELPERS_FILE`
+and `REMOTE_BASHRC_FILE` are supplied. Compatibility and publication tests guard
+the Python floor and private-data leaks; keep local configuration and archives
+out of commits.
 
-Tests use synthetic accounting, cgroup/GPU fixtures, temporary private storage,
-and a fake SSH executable. They require no cluster connection. The optional
-`test_shell_integration.py` checks external shell integrations only when their
-paths are supplied through `REMOTE_HELPERS_FILE` and `REMOTE_BASHRC_FILE`; those
-tests skip otherwise. `test_public_release.py` guards public documentation
-against machine-specific home paths, identity values, credentials, and stale
-generated copies; it also covers the license and CI workflow, and never walks
-`.git`, whose configuration holds the committer's address.
-`test_compatibility.py` enforces the Python 3.8 floor without needing a 3.8
-interpreter: it parses every source at that feature version and rejects PEP 604
-unions, subscripted builtin generics, and standard-library APIs added later.
-Start rollout with `storage-init`, `doctor`, then one short CPU-only job. Check
-multi-node launches, signals, storage errors, and retention separately on your
-site. Validate GPU behavior only when deliberately expanding beyond the current
-CPU-only scope. There is no automatic telemetry deletion. Remove the wrapper
-from future batch scripts to stop collection; preserve or archive existing
-samples as you choose.
-
-If a dotfile manager owns your shell configuration, keep this application bundle
-outside its source tree. Install a thin module that obtains `HPC_JOBMON_HOST`
-from private local data and sources, or links to, the canonical
-`shell/jobmon.zsh`; do not duplicate its functions. `hpc-jdeploy` finds the clone
-from the sourced file, resolving a symlinked module, so `HPC_JOBMON_TOOLS_DIR` is
-needed only when the helpers come from somewhere else. Keep
-machine-specific SSH aliases, usernames, cluster addresses, storage paths, and
-private template data in ignored local configuration.
-
-Reference definitions: [Slurm accounting](https://slurm.schedmd.com/sacct.html),
+References: [Slurm accounting](https://slurm.schedmd.com/sacct.html),
 [Slurm step sharing](https://slurm.schedmd.com/srun.html#OPT_overlap),
 [kernel cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html), and
 [NVIDIA queries](https://docs.nvidia.com/deploy/nvidia-smi/index.html).

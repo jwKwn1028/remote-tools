@@ -110,7 +110,8 @@ _jobmon_choose_job() {
     # Only a started job can have samples to watch; the others are counted, not listed.
     if [[ $fields[2] == (RUNNING|COMPLETING) && $fields[1] =~ $job_pattern ]]; then
       ids+=("$fields[1]")
-      rows+=("$(printf '%-16s %-11s %11s %5s %5s  %s' "${(@)fields[1,6]}")")
+      rows+=("$(printf '%-16s %-20.20s %-11s %11s %5s %5s  %s' \
+        "$fields[1]" "${fields[7]:-unavailable}" "${(@)fields[2,6]}")")
     else
       (( ++others ))
     fi
@@ -145,7 +146,7 @@ _jobmon_choose_job() {
       (( drawn > 1 )) && frame+=$'\e['$(( drawn - 1 ))'A'
       frame+=$'\e[J'"Choose a running job to watch ($selected/$count"
       (( others )) && frame+="; $others queued or not running"
-      frame+=$')\n'"  ${$(printf '%-16s %-11s %11s %5s %5s  %s' 'JOB ID' STATE ELAPSED CPUS NODES NODELIST)[1,width]}"$'\n'
+      frame+=$')\n'"  ${$(printf '%-16s %-20.20s %-11s %11s %5s %5s  %s' 'JOB ID' NAME STATE ELAPSED CPUS NODES NODELIST)[1,width]}"$'\n'
       for (( i = top; i < top + visible; i++ )); do
         if (( i == selected )); then
           frame+=$'\e[7m> '"${rows[i][1,width]}"$'\e[0m\n'

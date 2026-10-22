@@ -197,6 +197,7 @@ def initialize(root=None, runner=run_command):
         errors.append("SLURM_JOB_CPUS_PER_NODE does not give every allocation node at least one CPU; "
                       "per-node CPU denominators are unavailable.")
     metadata = {"schema_version": SCHEMA_VERSION, "job_id": job_id, "job_id_raw": raw,
+                "job_name": os.environ.get("SLURM_JOB_NAME") or None,
                 "run_id": run_id, "uid": os.getuid(), "user": identity(), "created_at": utc_now(),
                 "restart_count": os.environ.get("SLURM_RESTART_COUNT", "0"),
                 "cluster": os.environ.get("SLURM_CLUSTER_NAME"), "expected_nodes": nodes,

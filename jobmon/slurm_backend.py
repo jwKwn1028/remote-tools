@@ -88,13 +88,14 @@ def requested_memory(value, cpus, nodes):
             "allocation_bytes": int(amount * multiplier) if amount and multiplier else None}
 
 
-def parse_rows(output, fields):
+def parse_rows(output, fields, free_last=False):
     rows = []
     for line in output.splitlines():
         if not line.strip():
             continue
-        cells = line.split("|")
-        if len(cells) == len(fields) + 1 and cells[-1] == "":
+        # Query job names last so an embedded separator stays in the name.
+        cells = line.split("|", len(fields) - 1) if free_last else line.split("|")
+        if not free_last and len(cells) == len(fields) + 1 and cells[-1] == "":
             cells.pop()
         if len(cells) != len(fields):
             raise JobmonError("Malformed Slurm row: expected {} fields, received {}.".format(len(fields), len(cells)))
@@ -123,6 +124,7 @@ def normalize_allocation(parent, steps):
     rss = [{"job_id": row.get("JobID"), "job_id_raw": row.get("JobIDRaw"),
             "bytes": memory_bytes(row.get("MaxRSS"))} for row in steps]
     return {"job_id": parent.get("JobID"), "job_id_raw": parent.get("JobIDRaw"),
+            "job_name": parent.get("JobName") or None,
             "submit": parent.get("Submit"), "start": parent.get("Start"), "end": parent.get("End"),
             "state": parent.get("State"), "exit_code": parent.get("ExitCode"),
             "allocated_cpus": cpus, "allocated_nodes": number(parent.get("NNodes")),
@@ -138,7 +140,7 @@ def normalize_allocation(parent, steps):
 class SlurmBackend:
     ACCOUNT_FIELDS = ("JobIDRaw", "JobID", "User", "UID", "Submit", "Start", "End", "State",
                       "ElapsedRaw", "AllocCPUS", "NNodes", "TotalCPU", "ReqMem", "MaxRSS",
-                      "AllocTRES", "ExitCode", "NodeList", "Restarts", "DBIndex")
+                      "AllocTRES", "ExitCode", "NodeList", "Restarts", "DBIndex", "JobName")
     LIVE_FIELDS = ("JobID", "NTasks", "AveCPU", "AveRSS", "MaxRSS")
 
     def __init__(self, runner=run_command):
@@ -188,10 +190,11 @@ class SlurmBackend:
 
     def jobs(self, job_id=None):
         args = ["squeue", "--local", "--array", "--noheader", "--user=" + self.user,
-                "--format=%i|%u|%T|%M|%C|%D|%R"]
+                "--format=%i|%u|%T|%M|%C|%D|%R|%j"]
         if job_id:
             args.append("--jobs=" + validate_job_id(job_id))
-        rows = parse_rows(self.run(args), ("job_id", "user", "state", "elapsed", "cpus", "nodes", "reason_or_nodes"))
+        rows = parse_rows(self.run(args), ("job_id", "user", "state", "elapsed", "cpus", "nodes",
+                                          "reason_or_nodes", "job_name"), free_last=True)
         rows = [r for r in rows if r["user"] == self.user]
         return [r for r in rows if r["job_id"] == job_id] if job_id else rows
 
@@ -216,7 +219,7 @@ class SlurmBackend:
         args = ["sacct", "--local", "--duplicates", "--jobs=" + job_id, "--user=" + self.user,
                 "--starttime=" + start, "--endtime=now", "--noheader", "--parsable2", "--units=M",
                 "--format=" + ",".join(f + "%256" for f in fields)]
-        rows = parse_rows(self.run(args), fields)
+        rows = parse_rows(self.run(args), fields, free_last=fields[-1] == "JobName")
         parents = [r for r in rows if "." not in r["JobID"] and
                    (r["JobID"] == job_id or ("_" not in job_id and r["JobIDRaw"] == job_id)) and
                    r["User"] == self.user and r["UID"] == str(self.uid)]
