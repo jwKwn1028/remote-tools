@@ -78,8 +78,7 @@ def memory_bytes(value, default_unit="M"):
 def requested_memory(value, cpus, nodes):
     match = re.fullmatch(r"(.+?)([cn])?", value or "")
     amount = memory_bytes(match.group(1)) if match else None
-    # An unreadable request has no per-CPU/per-node scope either. The trailing
-    # letter of an unparseable value must never be reported as that scope.
+    # An invalid amount cannot establish per-CPU or per-node scope.
     if amount is None:
         return {"bytes": None, "scope": "unavailable", "allocation_bytes": None}
     suffix = match.group(2)
@@ -169,8 +168,7 @@ class SlurmBackend:
                     result["errors"].append(str(exc))
         accounting_available = False
         if "sacct" in result["fields"]:
-            # Help/version exit before Slurm checks storage. Exercise the actual
-            # query path for this user on this cluster, within one fixed minute.
+            # Help/version do not check storage; probe this user's last minute instead.
             end = dt.datetime.now()
             start = end - dt.timedelta(minutes=1)
             try:

@@ -136,8 +136,7 @@ class RunHistory:
         state["allocated_cpus"] = cpus
         valid_interval = delta is not None and duration and duration <= interval * 1.5
         if newest:
-            # The newest interval alone, so a ramp-up is not hidden by the running average.
-            # A first sample, counter reset, or gap leaves it unavailable rather than zero.
+            # Keep recent changes visible; first samples, resets, and gaps stay unavailable.
             state["interval_seconds"] = interval
             state["latest_interval_busy_cores"] = delta / duration if valid_interval else None
             state["latest_interval_cpu_percent"] = (100 * delta / (duration * cpus)
@@ -147,7 +146,7 @@ class RunHistory:
             state["cpu_seconds_available"] = True
             state["cpu_seconds_covered"] += delta
             state["cpu_wall_seconds_covered"] += duration
-            # The busiest single interval so far, the CPU counterpart of a memory peak.
+            # Retain the busiest interval.
             state["max_interval_busy_cores"] = max(delta / duration, state["max_interval_busy_cores"] or 0)
             if cpus:
                 state["max_interval_cpu_percent"] = max(100 * delta / (duration * cpus),
@@ -200,8 +199,7 @@ class RunHistory:
                 entry = (when, stream_name, self.memory_sequence, node, current, interval)
                 bisect.insort(self.pending_memory.setdefault(node, []), entry)
         if all(n in self.nodes for n in expected):
-            # Only commit times every node has reached. The remaining tail can
-            # be recomputed when delayed records arrive, including revised peaks.
+            # Commit only through the slowest node; later records can revise tail peaks.
             watermark = min(self.nodes[n]["last"] for n in expected)
             ready = []
             for pending in self.pending_memory.values():
@@ -236,8 +234,7 @@ class RunHistory:
         return peak, samples
 
     def refresh(self):
-        # Merge streams chronologically with one pending record per stream. This
-        # keeps both memory use and cross-node peak alignment independent of job length.
+        # One pending record per stream bounds memory while preserving chronological alignment.
         pending = []
         with ExitStack() as opened:
             for path in sorted(self.directory.glob("*.jsonl")):
@@ -295,8 +292,7 @@ class RunHistory:
 
     def summary(self):
         self.refresh()
-        # Preview the uncommitted tail without making its peaks permanent. A
-        # later append from a slow node may change its chronological alignment.
+        # Tail peaks remain provisional until delayed nodes confirm their alignment.
         pending = [entry for entries in self.pending_memory.values() for entry in entries]
         concurrent_peak, aligned_samples = self.align_memory(
             pending, dict(self.latest_memory), self.concurrent_memory_peak, self.aligned_memory_samples)
@@ -400,10 +396,7 @@ class SavedHistory:
         for path in sorted(directory.iterdir()):
             if path.name in self.runs:
                 continue
-            # Only a directory can be a run. An unrelated entry, such as the
-            # .nfs stub shared storage leaves behind, is not saved history and
-            # must not block a fetch of the runs beside it. A symlinked
-            # directory still reaches load_run, which rejects it.
+            # Skip unrelated files such as .nfs stubs; load_run still rejects symlinked directories.
             if not path.is_dir():
                 if path.name not in self.ignored:
                     self.ignored.append(path.name)
@@ -596,8 +589,7 @@ def format_report(report):
             run["latest_sample_timestamp"] or "unavailable", display_value(run["sample_age_seconds"])))
         lines.append("  CPU {} of allocated cores over {:.0f} sampled core-seconds".format(
             display_value(run["cpu_percent_covered_intervals"], "%"), run["cpu_covered_core_seconds"]))
-        # On one node the concurrent peak, the sum of node peaks, and the node's own
-        # peak are the same reading; only several nodes make them differ.
+        # On a single node, these aggregate peaks duplicate the node's peak.
         if multi_node(run):
             lines.append("  Memory across nodes: concurrent peak {}; sum of independent node peaks {}".format(
                 display_bytes(run["concurrent_memory_peak_bytes"]),
@@ -645,8 +637,7 @@ def format_report(report):
     return "\n".join(lines)
 
 
-# A node is stale once it misses this many sampling intervals, with a floor that
-# absorbs shared-filesystem delays on short intervals.
+# Staleness allows shared-filesystem delays, including at short sampling intervals.
 STALE_FACTOR = 2.5
 STALE_MARGIN_SECONDS = 30
 # Gaps that hold for a whole run, so a watch states them once instead of per row.
@@ -693,8 +684,7 @@ def run_start(report, run):
     if created is not None and created >= newest and snapshot is not None:
         for queue in report["scheduler"]["queue"]:
             elapsed = cpu_seconds(queue.get("elapsed"))
-            # Slurm's start is authoritative for the running allocation. A start after this
-            # run began belongs to a later allocation of a requeued job, so it is not used.
+            # Prefer Slurm's start unless it belongs to a later, requeued allocation.
             if (queue.get("state") in ("RUNNING", "COMPLETING") and elapsed is not None
                     and snapshot - elapsed <= created + 60):
                 return "slurm", snapshot - elapsed

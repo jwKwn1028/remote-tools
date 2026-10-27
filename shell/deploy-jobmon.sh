@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Preview by default; --apply installs the Python tools and inert batch wrapper,
-# over SSH or, with --local, into the current account on this machine.
+# Preview by default; --apply installs over SSH, or in this account with --local.
 set -euo pipefail
 
 apply=0
@@ -40,8 +39,7 @@ for source_file in "${sources[@]}"; do
 done
 command -v sha256sum >/dev/null || { printf 'sha256sum is required for verified deployment.\n' >&2; exit 2; }
 ssh_options=(-T -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1)
-# Run one fixed POSIX script in the target account: over SSH, or here for --local.
-# Both paths execute the identical script, so verification and refusals match.
+# Use the same fixed install script locally and over SSH.
 run_target() {
     if (( install_here )); then
         sh -c "$1"
@@ -58,8 +56,7 @@ if (( ! apply )); then
     printf 'Preview only. Add --apply to copy these files.\n'
     exit 0
 fi
-# Stage the fixed source set with a checksum manifest. The remote side validates
-# and compiles the complete release before atomically switching `current`.
+# Stage checksummed sources; validate the full release before switching current.
 local_staging=$(mktemp -d)
 cleanup_local() {
     rm -f -- "$local_staging/jobmon.py" "$local_staging/slurm_backend.py" \
@@ -78,8 +75,7 @@ done
     sha256sum "${release_files[@]}" > SHA256SUMS
 )
 
-# Arguments never become remote shell code. Only the fixed source set and its
-# checksum manifest are sent.
+# Send only fixed sources and checksums; never turn arguments into remote code.
 # shellcheck disable=SC2016
 install_script='
 set -eu
@@ -116,8 +112,7 @@ chmod 700 "$staging/monitored-job.sh"
 (cd "$staging" && sha256sum -c SHA256SUMS)
 bash -n "$staging/monitored-job.sh"
 
-# Refuse an unrelated script, directory, or symlink before changing current.
-# A byte-identical manual install can be migrated to the managed link.
+# Refuse unrelated wrapper paths; migrate only byte-identical manual copies.
 if [ -L "$wrapper" ]; then
     [ "$(readlink "$wrapper")" = "$wrapper_target" ] || {
         printf "jobmon deploy: refusing unrelated wrapper symlink: %s\n" "$wrapper" >&2; exit 1;
@@ -128,8 +123,7 @@ elif [ -e "$wrapper" ]; then
         exit 1
     fi
 fi
-# Apply the wrapper policy to the Python entry points too: refuse an unrelated
-# directory or file, and migrate only a byte-identical manual copy.
+# Apply the same policy to Python entry points.
 for file in current slurm_backend.py collect.py jobmon.py; do
     target="$base/$file"
     if [ -L "$target" ]; then
@@ -181,9 +175,8 @@ fi
 
 # Keep existing bin directory permissions; only the installed wrapper is private.
 chmod 700 "$release/monitored-job.sh"
-# On a first install the entry points below would dangle until current exists,
-# so point current at the verified release before creating them. The switch at
-# the end remains the single atomic step that activates an upgrade.
+# Initialize current before creating entry points on first install.
+# Upgrades activate atomically at the final switch below.
 if [ ! -e "$base/current" ]; then
     next_link="$base/.current.$$"
     ln -s "releases/$release_id" "$next_link"

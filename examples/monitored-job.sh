@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Invoke from your existing sbatch script, after its allocation/module setup:
+# Invoke after allocation/module setup in your sbatch script:
 #   bash /path/to/monitored-job.sh srun your-application its-arguments
 # Preserve your workload's existing launcher and resource/binding options.
 # Trap handlers below are invoked indirectly by Bash.
@@ -26,8 +26,7 @@ jobmon_cleaned=0
 declare -a jobmon_signal_pids=()
 declare -A jobmon_signal_starts=()
 
-# /proc identities keep a PID recycled during shutdown out of the signal set.
-# No process-group changes: the optional collector still measures the batch group.
+# Track /proc identities to avoid signaling recycled PIDs; preserve the batch group.
 jobmon_read_process() {
     local pid=$1 info
     local -a fields
@@ -64,8 +63,7 @@ jobmon_cleanup() {
     local application_status=$1 attempts=0
     (( jobmon_cleaned == 0 )) || return 0
     jobmon_cleaned=1
-    # The workload result is final; an interruption during monitoring cleanup
-    # must not replace it with the wrapper's signal status.
+    # Cleanup interruptions must preserve the workload's final exit status.
     trap '' TERM INT HUP
     # Every monitoring operation is guarded so failures cannot mask workload status.
     if [[ -n $jobmon_run_dir ]]; then
@@ -101,8 +99,7 @@ jobmon_signal() {
         jobmon_workload_pid=${!:-}
     fi
     if [[ -n $jobmon_workload_pid ]]; then
-        # Snapshot descendants before signaling their parents, which may exit
-        # immediately and orphan children still finishing their signal handlers.
+        # Snapshot descendants before signaling parents that could exit and orphan them.
         for path in /proc/[0-9]*/stat; do
             pid=${path%/stat}
             pid=${pid##*/}

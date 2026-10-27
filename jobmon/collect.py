@@ -185,11 +185,10 @@ def initialize(root=None, runner=run_command):
     try:
         cpus = expand_cpu_counts(os.environ.get("SLURM_JOB_CPUS_PER_NODE"))
     except JobmonError as exc:
-        # Match the sibling hostname lookup: record the failure, keep collecting.
+        # Keep collecting when allocation details are unavailable.
         cpus = []
         errors.append(str(exc))
-    # Store only a layout load_run accepts. A short or zero-CPU map would make
-    # the whole run permanently unreadable instead of losing its denominators.
+    # Invalid CPU maps would make the entire run unreadable by load_run.
     cpu_map = {}
     if nodes and len(nodes) == len(cpus) and all(count >= 1 for count in cpus):
         cpu_map = dict(zip(nodes, cpus))
@@ -390,8 +389,7 @@ class NvidiaSampler:
         self.enabled = True
         self.exclusive = False
         if not self.uuids:
-            # An unset mapping turns GPU collection off. Only an allocation that holds
-            # GPUs needs a per-sample reminder of how to attribute them.
+            # GPU collection is off without a mapping; warn only if GPUs are allocated.
             if gpus_allocated(env):
                 self.reason = ("no verified GPU UUID mapping; set JOBMON_GPU_UUIDS per node after "
                                "checking allocation ownership")

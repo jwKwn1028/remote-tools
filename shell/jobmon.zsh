@@ -1,9 +1,6 @@
-# Source this file from zsh. Set HPC_JOBMON_HOST to an SSH destination: an alias
-# from ~/.ssh/config, or user@host when the default port and key already work.
-# A dotfile manager may provide it, but this public source must not hard-code it.
+# Source from zsh; set HPC_JOBMON_HOST privately to an SSH alias or user@host.
 
-# Record this bundle's location while it is being sourced, so hpc-jdeploy finds
-# the installer and local plotter from any clone. :A resolves symlinked modules.
+# Locate bundled tools while sourcing; :A resolves symlinked modules.
 () {
   emulate -L zsh
   typeset -g _jobmon_bundle_dir=${${(%):-%x}:A:h:h}
@@ -81,8 +78,7 @@ _jobmon_request() {
     esac
   done
   if [[ $operation == watch ]]; then
-    # Watch prints clock times; send this workstation's UTC offset so they match its
-    # clock even when the cluster runs in another zone.
+    # Display watch times in the workstation's UTC offset.
     local zone=${(%):-%D{%z}}
     if [[ $zone == [+-][0-9][0-9][0-9][0-9] ]]; then
       request+=',"utc_offset_minutes":'$(( ${zone[1]}1 * (10#${zone[2,3]} * 60 + 10#${zone[4,5]}) ))
@@ -92,8 +88,7 @@ _jobmon_request() {
   print -r -- "$request" | _jobmon_ssh
 }
 
-# Choose one of your running jobs on the terminal and return its ID in REPLY.
-# Keys are read from and the menu drawn on /dev/tty, so piped output stays clean.
+# Return the selected running job in REPLY; use /dev/tty to keep stdout clean.
 _jobmon_choose_job() {
   emulate -L zsh
   local action=${1:-watch}
@@ -133,9 +128,8 @@ _jobmon_choose_job() {
   visible=$(( count < ${LINES:-24} - 4 ? count : ${LINES:-24} - 4 ))
   (( visible < 1 )) && visible=1
   width=$(( ${COLUMNS:-80} - 3 ))
-  # While the menu is open, Ctrl-C is read as a key, so it cancels like q however
-  # early it is pressed, and keys typed ahead are not echoed. The local trap covers
-  # an external SIGINT; emulate -L restores any TRAPINT of your own afterwards.
+  # Read Ctrl-C as cancel without echo; trap external SIGINT locally.
+  # emulate -L restores the caller's TRAPINT.
   TRAPINT() { return 130 }
   {
     terminal=$(command stty -g </dev/tty) && command stty -isig -echo </dev/tty
@@ -199,7 +193,58 @@ hpc-jwatch() {
   fi
   _jobmon_request watch "$@"
 }
-hpc-jreport() { emulate -L zsh; _jobmon_request report "$@"; }
+hpc-jreport() {
+  emulate -L zsh
+  if (( ! ${argv[(Ie)--zip]} )); then
+    _jobmon_request report "$@"
+    return
+  fi
+  local job_id=${1:-} days=30 destination=downloads option value REPLY
+  local job_pattern='^[1-9][0-9]*(_[0-9]+)?$'
+  if [[ ! $job_id =~ $job_pattern || ${#job_id} -gt 40 ]]; then
+    print -u2 -- 'Usage: hpc-jreport JOB_ID --zip [--output-dir DIRECTORY] [--days N]'
+    return 2
+  fi
+  shift
+  while (( $# )); do
+    option=$1
+    shift
+    case $option in
+      --zip) ;;
+      --days)
+        value=${1:-}
+        local integer_pattern='^[1-9][0-9]{0,3}$'
+        if [[ ! $value =~ $integer_pattern || $value -gt 3650 ]]; then
+          print -u2 -- 'jobmon: invalid positive integer for --days.'
+          return 2
+        fi
+        days=$value
+        shift
+        ;;
+      --output-dir)
+        if [[ -z ${1:-} ]]; then
+          print -u2 -- 'jobmon: --output-dir needs a directory.'
+          return 2
+        fi
+        destination=$1
+        shift
+        ;;
+      *) print -u2 -- "jobmon: unsupported ZIP export option: $option"; return 2 ;;
+    esac
+  done
+  local tools_dir=${HPC_JOBMON_TOOLS_DIR:-${_jobmon_bundle_dir:-}}
+  if [[ ! -r $tools_dir/jobmon/live.py ]]; then
+    print -u2 -- 'jobmon: cannot find jobmon/live.py; source helpers from the clone or set HPC_JOBMON_TOOLS_DIR.'
+    return 2
+  fi
+  if ! command -v python3 >/dev/null; then
+    print -u2 -- 'jobmon: ZIP export needs an existing local Python 3.8+ interpreter named python3.'
+    return 2
+  fi
+  _jobmon_host || return
+  command python3 "$tools_dir/jobmon/live.py" "$job_id" --host "$REPLY" --zip \
+    --output-dir="$destination" --days "$days"
+}
 
 hpc-live() {
   emulate -L zsh

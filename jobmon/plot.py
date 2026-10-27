@@ -2,20 +2,194 @@
 """Render a fetched jobmon archive as a private, standalone HTML time plot."""
 
 import argparse
+import datetime as dt
 import json
 import math
 import os
 from pathlib import Path
 import sys
 import tarfile
+import tempfile
+import unicodedata
+import xml.etree.ElementTree as ET
+import zipfile
 
-from collect import SCHEMA_VERSION, checked_name, private_open
+from collect import SCHEMA_VERSION, checked_name, private_directory, private_open
 from jobmon import (MAX_LINE, MEMORY_SCOPE_NOTES, RunHistory, display_elapsed, run_start,
                     sample_point, timestamp_seconds)
 from slurm_backend import JobmonError, validate_job_id
 
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 MAX_MEMBERS = 10000
+EXPORT_SPEC = {
+    "series": {
+        "cpu": [["cpu", "Last interval", "#7aa2f7"], ["average", "Average", "#ff9e64"],
+                ["maximum", "Maximum", "#9ece6a"]],
+        "memory": [["memory", "Current", "#7aa2f7"], ["memory_peak", "Sampled maximum", "#ff9e64"]]},
+    "columns": ["timestamp_utc", "elapsed_seconds", "cpu_percent", "cpu_average_percent", "cpu_maximum_percent",
+                "memory_gib", "memory_peak_gib", "sample_count", "final", "gap", "scope"],
+    "units": {"time": "Unix milliseconds (UTC)", "elapsed_seconds": "seconds since first collected sample",
+              "cpu": "percent of allocated cores", "average": "percent of allocated cores",
+              "maximum": "percent of allocated cores", "memory": "GiB", "memory_peak": "GiB",
+              "raw_sample_memory": "bytes"}}
+
+
+def filename_part(value, max_bytes):
+    normalized = unicodedata.normalize("NFKC", value or "")
+    safe, separator = [], False
+    for character in normalized:
+        if unicodedata.category(character)[0] in "LMN" or character in "_.-":
+            safe.append(character)
+            separator = False
+        elif not separator:
+            safe.append("-")
+            separator = True
+    name = "".join(safe).strip("._-")
+    name = name.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore").rstrip("._-")
+    return name or "unnamed"
+
+
+def iso_time(milliseconds):
+    seconds, rest = divmod(int(milliseconds), 1000)
+    value = dt.datetime.fromtimestamp(seconds, dt.timezone.utc).replace(microsecond=rest * 1000)
+    return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def csv_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, float) and value.is_integer():
+        text = str(int(value))
+    else:
+        text = str(value)
+    return '"' + text.replace('"', '""') + '"'
+
+
+def svg_chart(chart, points, axis="clock"):
+    """Workstation SVG counterpart of the browser renderer, using the same series."""
+    root = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg", "id": chart, "width": "1000", "height": "280",
+                              "viewBox": "0 0 1000 280", "role": "img",
+                              "aria-label": "CPU history" if chart == "cpu" else "Memory history"})
+
+    def add(tag, attributes, text=None):
+        child = ET.SubElement(root, tag, {key: str(value) for key, value in attributes.items()})
+        if text is not None:
+            child.text = str(text)
+        return child
+
+    add("rect", {"width": 1000, "height": 280, "fill": "#1d202f"})
+    add("style", {}, "text{font:11px ui-monospace,monospace;fill:#a9b1d6}")
+    specs = EXPORT_SPEC["series"][chart]
+    if not points:
+        add("text", {"x": 500, "y": 120, "text-anchor": "middle"}, "Waiting for saved samples")
+        return ET.tostring(root, encoding="unicode")
+    first, last = points[0]["time"], points[-1]["time"]
+    duration = max(1000, last - first)
+    maximum = max([100 if chart == "cpu" else 0]
+                  + [point[key] for point in points for key, _, _ in specs if point[key] is not None])
+    maximum = 100 if chart == "cpu" and maximum == 100 else maximum * 1.1 if maximum > 0 else 1
+
+    def x(when):
+        return 74 + (when - first) / duration * 896
+
+    def y(value):
+        return 236 - value / maximum * 220
+
+    for tick in range(5):
+        value, px = maximum * tick / 4, 74 + 896 * tick / 4
+        py = y(value)
+        add("line", {"x1": 74, "x2": 970, "y1": py, "y2": py, "stroke": "#343a55"})
+        label = csv_cell(float("{:.3g}".format(value))).strip('"') + ("%" if chart == "cpu" else "")
+        add("text", {"x": 64, "y": py + 4, "text-anchor": "end"}, label)
+        stamp = first + (last - first) * tick / 4
+        if axis == "elapsed":
+            seconds = int(max(0, (stamp - first) / 1000) + 0.5)
+            label = "{}:{:02d}:{:02d}".format(seconds // 3600, seconds // 60 % 60, seconds % 60)
+        else:
+            local = dt.datetime.fromtimestamp(int(stamp) / 1000).astimezone()
+            label = local.strftime("%H:%M:%S" if last - first < 86400000 else "%Y-%m-%d %H:%M:%S")
+        add("text", {"x": px, "y": 264, "text-anchor": "start" if tick == 0 else "end" if tick == 4 else "middle"},
+            label)
+    if chart == "cpu":
+        add("line", {"x1": 74, "x2": 970, "y1": y(100), "y2": y(100), "stroke": "#737aa2",
+                     "stroke-dasharray": "5 4", "data-reference": "100-percent"})
+        if maximum > 100:
+            add("text", {"x": 964, "y": max(30, y(100) - 6), "text-anchor": "end"}, "100%")
+    for key, _, color in specs:
+        path, pen = [], False
+        for point in points:
+            if point["gap"] or point[key] is None:
+                pen = False
+            if point[key] is None:
+                continue
+            path.append(("L" if pen else "M") + "{:.2f},{:.2f}".format(x(point["time"]), y(point[key]))
+                        + ("" if pen else "l0,0"))
+            pen = True
+        add("path", {"d": "".join(path), "fill": "none", "stroke": color,
+                     "stroke-width": 2, "stroke-linecap": "round"})
+    if not any(point[key] is not None for point in points for key, _, _ in specs):
+        add("text", {"x": 500, "y": 120, "text-anchor": "middle"}, "No available measurements")
+    return ET.tostring(root, encoding="unicode")
+
+
+def export_files(data, run, node, chart, captured=None, axis="clock", timezone_name=None):
+    validate_job_id(data["job_id"])
+    if not node["points"]:
+        raise JobmonError("No saved samples to export.")
+    captured = captured or dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    points = [{key: value for key, value in point.items() if key != "raw_sample"} for point in node["points"]]
+    raw = [point["raw_sample"] for point in node["points"] if isinstance(point.get("raw_sample"), str)]
+    snapshot = {"schema_version": 1, "exported_at": captured, "job_id": data["job_id"], "job_name": run.get("job_name"),
+                "run_id": run["run_id"], "node": node["node"], "chart": chart, "time_axis": axis,
+                "timezone": timezone_name or dt.datetime.now().astimezone().strftime("%Z (UTC%z)"),
+                "run_metadata": run.get("metadata"), "workload_exit_code": run["exit_code"],
+                "diagnostics": data["diagnostics"], "scope_notes": data["scope_notes"], "units": EXPORT_SPEC["units"],
+                "raw_sample_count": len(raw), "raw_samples_complete": len(raw) == len(points), "points": points}
+    rows = [",".join(EXPORT_SPEC["columns"])]
+    for point in points:
+        scope = point["scope"] if point["scope"] in data["scope_notes"] else "unavailable"
+        rows.append(",".join(csv_cell(value) for value in (
+            iso_time(point["time"]), (point["time"] - points[0]["time"]) / 1000, point["cpu"], point["average"],
+            point["maximum"], point["memory"], point["memory_peak"], point["samples"], point["final"],
+            point["gap"], scope)))
+    files = [("chart.svg", svg_chart(chart, points, axis)), ("data.csv", "\r\n".join(rows) + "\r\n"),
+             ("data.json", json.dumps(snapshot, ensure_ascii=False, allow_nan=False, indent=2) + "\n")]
+    if raw:
+        files.append(("samples.jsonl", "\n".join(raw) + "\n"))
+    stamp = captured.replace("-", "").replace(":", "").replace(".", "")
+    filename = "jobmon-{}-{}-{}-{}-{}-{}.zip".format(
+        data["job_id"], filename_part(run.get("job_name"), 64), filename_part(run["run_id"], 48),
+        filename_part(node["node"], 32), chart, stamp)
+    return filename, files
+
+
+def write_exports(data, destination):
+    validate_job_id(data["job_id"])
+    selections = [(run, node) for run in data["runs"] for node in run["nodes"] if node["points"]]
+    if not selections:
+        raise JobmonError("No saved samples to export; the job must have used the opt-in collector.")
+    directory = private_directory(destination, create=True)
+    outputs = []
+    for run, node in selections:
+        for chart in EXPORT_SPEC["series"]:
+            filename, files = export_files(data, run, node, chart)
+            path = directory / filename
+            fd, temporary = tempfile.mkstemp(prefix=".jobmon-", suffix=".zip.partial", dir=str(directory))
+            try:
+                with os.fdopen(fd, "wb") as stream, \
+                        zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as bundle:
+                    for name, contents in files:
+                        info = zipfile.ZipInfo(name, dt.datetime.now().timetuple()[:6])
+                        info.create_system = 3
+                        info.external_attr = 0o100600 << 16
+                        bundle.writestr(info, contents.encode("utf-8"))
+                os.link(temporary, str(path))
+            finally:
+                os.unlink(temporary)
+            outputs.append(path)
+    return outputs
 
 
 def warning(errors, message):
@@ -24,8 +198,7 @@ def warning(errors, message):
 
 
 def metadata_for_plot(value, job_id, run_id):
-    # The local archive belongs to this reader, but its saved UID/user belong to
-    # the cluster account. Never rewrite them to make an offline plot readable.
+    # Validate local ownership separately; preserve the saved cluster UID/user.
     if (not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION
             or value.get("job_id") != job_id or value.get("run_id") != run_id):
         raise JobmonError("Archive metadata does not match the requested job/run.")
@@ -213,11 +386,15 @@ border-bottom:1px solid var(--line);overflow-x:auto}#job-tabs[hidden]{display:no
 #job-tabs button::before{content:"";display:inline-block;width:6px;height:6px;margin-right:8px;
 border-radius:50%;background:var(--muted)}#job-tabs button.live::before{background:var(--green)}
 #job-tabs button.warning::before{background:var(--orange)}
+#job-tabs button.finished::before{background:var(--green)}#job-tabs button.failed::before{background:var(--red)}
 main{display:grid;grid-template-columns:260px minmax(0,1fr);min-height:calc(100vh - 45px)}
 main.sidebar-collapsed{grid-template-columns:minmax(0,1fr)}
 aside{padding:18px;background:var(--bg-dark);border-right:1px solid var(--line);overflow-wrap:anywhere}
 aside h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--magenta);margin:0 0 18px}
 .charts{padding:20px;min-width:0}p{line-height:1.6}.controls{display:grid;gap:16px}
+#completion{padding:12px 14px;border:1px solid var(--green);border-left-width:3px;border-radius:5px;
+background:var(--bg-dark);color:var(--green);white-space:pre-wrap;margin:0 0 18px}
+#completion.failed{border-color:var(--red);color:var(--red)}
 label{display:grid;gap:6px;color:var(--fg-dim);font-size:12px}
 select,button{font:inherit;padding:6px 8px;border:1px solid var(--edge);border-radius:5px;
 background:var(--bg-high);color:var(--fg-dim);min-width:0;max-width:100%}
@@ -256,6 +433,7 @@ aria-hidden="true" focusable="false"><rect x="3" y="3" width="18" height="18" rx
 <p id="scheduler"></p><small id="scope"></small>
 <details><summary>Diagnostics</summary><pre id="diagnostics"></pre></details>
 </aside><div class="charts">
+<p id="completion" role="status" aria-live="polite" hidden></p>
 <section><h2>CPU · % of allocated cores</h2><div class="legend" id="cpu-legend"></div>
 <svg id="cpu" width="1000" height="280" viewBox="0 0 1000 280" role="img" aria-label="CPU history"></svg>
 <output id="cpu-reading">Hover or tap to inspect.</output>
@@ -277,10 +455,8 @@ let data=JSON.parse(document.getElementById("data").textContent);
 let jobs=[], selectedJob=null;
 const jobViews=new Map();
 const byId=id=>document.getElementById(id), ns="http://www.w3.org/2000/svg";
-const series={
- cpu:[["cpu","Last interval","#7aa2f7"],["average","Average","#ff9e64"],["maximum","Maximum","#9ece6a"]],
- memory:[["memory","Current","#7aa2f7"],["memory_peak","Sampled maximum","#ff9e64"]]
-};
+const exportSpec=__JOBMON_EXPORT_SPEC__;
+const series=exportSpec.series;
 function element(tag,attrs,text){
  const el=document.createElementNS(ns,tag);
  for(const [key,value] of Object.entries(attrs||{}))el.setAttribute(key,value);
@@ -362,6 +538,11 @@ function draw(){
  const run=data.runs[Number(byId("run").value)], node=run?.nodes[Number(byId("node").value)];
  const name=run?.job_name||jobName(data);
  byId("title").textContent="Job "+data.job_id+(name?" ("+name+")":"");
+ const result=completionResult(run), completion=byId("completion");
+ completion.hidden=!result;completion.className=result?.kind||"";
+ const message=result?result.message+"\\nBatch wrapper result for the selected run. "+
+  "Use hpc-jreport "+data.job_id+" for final Slurm state.":"";
+ if(completion.textContent!==message)completion.textContent=message;
  const runtime=run?.runtime, labels={slurm:"Elapsed",monitoring:"Monitored",samples:"Sample span"};
  byId("runtime").textContent=runtime?.seconds!=null?labels[runtime.source]+" "+runtime.display:"Elapsed unavailable";
  const origins={slurm:"Job start inferred from the initial Slurm snapshot",
@@ -403,6 +584,12 @@ function selectRun(preferredNode){
 }
 function jobName(job){
  return job.scheduler?.queue?.[0]?.job_name||[...job.runs].reverse().find(run=>run.job_name)?.job_name||"";
+}
+function completionResult(run){
+ if(!Number.isInteger(run?.exit_code))return null;
+ const code=run.exit_code;
+ return code===0?{kind:"finished",label:"finished",message:"Workload finished (exit 0)."}:
+  {kind:"failed",label:"exit "+code,message:"Workload exited with code "+code+". Check the job's output/error logs."};
 }
 function rememberJob(){
  if(!jobs.length || !data.job_id)return;
@@ -452,10 +639,11 @@ function renderJobTabs(){
    tabs.appendChild(button);
   }
   const name=jobName(job), selected=job.job_id===selectedJob;
-  button.textContent=job.job_id+(name?" ("+name+")":"");
+  const result=completionResult(job.runs[job.runs.length-1]);
+  button.textContent=job.job_id+(result?" · "+result.label:"")+(name?" ("+name+")":"");
   button.title=button.textContent+" · "+(job.connection||"Saved snapshot");
   button.setAttribute("aria-selected",String(selected));button.tabIndex=selected?0:-1;
-  button.className=job.connection==="Live"?"live":job.connection==="Connecting"?"":"warning";
+  button.className=result?result.kind:job.connection==="Live"?"live":job.connection==="Connecting"?"":"warning";
  }
 }
 function update(next){
@@ -539,12 +727,9 @@ function exportFiles(id){
   run_id:run.run_id,node:node.node,chart:id,time_axis:byId("axis").value,
   timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,run_metadata:run.metadata||null,
   workload_exit_code:run.exit_code,diagnostics:data.diagnostics,scope_notes:data.scope_notes,
-  units:{time:"Unix milliseconds (UTC)",elapsed_seconds:"seconds since first collected sample",
-         cpu:"percent of allocated cores",average:"percent of allocated cores",maximum:"percent of allocated cores",
-         memory:"GiB",memory_peak:"GiB",raw_sample_memory:"bytes"},
+  units:exportSpec.units,
   raw_sample_count:raw.length,raw_samples_complete:raw.length===points.length,points:points};
- const columns=["timestamp_utc","elapsed_seconds","cpu_percent","cpu_average_percent","cpu_maximum_percent",
-  "memory_gib","memory_peak_gib","sample_count","final","gap","scope"];
+ const columns=exportSpec.columns;
  const cell=value=>value===null || value===undefined?"":'"'+String(value).replace(/"/g,'""')+'"';
  const csv=[columns.join(",")];
  for(const point of points){
@@ -582,12 +767,11 @@ if(data.live){
 }
 </script>
 </html>
-"""
+""".replace("__JOBMON_EXPORT_SPEC__", json.dumps(EXPORT_SPEC, separators=(",", ":")))
 
 
 def render_html(data):
-    # A name/error may contain HTML, including </script>. Keep every dynamic
-    # value inert in the JSON payload and use textContent in the renderer.
+    # Escape embedded HTML, including </script>; the renderer uses textContent.
     payload = json.dumps(data, ensure_ascii=True, allow_nan=False).replace("<", "\\u003c")
     payload = payload.replace(">", "\\u003e").replace("&", "\\u0026")
     return HTML.replace("__JOBMON_DATA__", payload)

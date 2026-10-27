@@ -20,15 +20,15 @@ import webbrowser
 
 from collect import SCHEMA_VERSION, checked_name
 from jobmon import MAX_LINE, MEMORY_SCOPE_NOTES
-from plot import metadata_for_plot, render_html, with_runtime
+from plot import metadata_for_plot, render_html, with_runtime, write_exports
 from slurm_backend import JobmonError, validate_job_id
 
 # As in _jobmon_ssh: user arguments travel only in JSON on stdin.
 REMOTE_COMMAND = ('if [ -r "$HOME/.config/jobmon/env.sh" ]; then . "$HOME/.config/jobmon/env.sh" || exit; fi; '
                   'exec "${JOBMON_PYTHON:-python3}" "$HOME/.local/libexec/jobmon/jobmon.py" _transport')
-# Original JSON is escaped again inside the event; allow its bounded envelope
-# to exceed the on-disk sample-line limit without truncating valid raw data.
+# Allow for JSON escaping when raw samples are nested inside events.
 MAX_EVENT_LINE = 4 * MAX_LINE
+SNAPSHOT_TIMEOUT = 120
 
 
 class LiveState:
@@ -73,8 +73,13 @@ class LiveState:
                     if saved is None:
                         continue
                     completion = run.get("completion")
-                    if completion and type(completion.get("workload_exit_code")) is int:
-                        saved["exit_code"] = completion["workload_exit_code"]
+                    if completion is not None:
+                        if (isinstance(completion, dict) and completion.get("job_id") == self.job_id
+                                and completion.get("run_id") == saved["run_id"]
+                                and type(completion.get("workload_exit_code")) is int):
+                            saved["exit_code"] = completion["workload_exit_code"]
+                        else:
+                            self._error("Ignoring invalid wrapper completion for run " + saved["run_id"])
                     for error in run.get("errors", []):
                         self._error(error)
                 for error in event.get("errors", []):
@@ -184,11 +189,15 @@ class MultiJobState:
 
 
 class SSHSource:
-    def __init__(self, state, host):
+    def __init__(self, state, host, count=None, days=30):
         if not re.fullmatch(r"[A-Za-z0-9_.@:][A-Za-z0-9_.@:-]*", host or ""):
             raise JobmonError("Use a valid SSH config alias or user@host.")
         self.state = state
         self.host = host
+        self.count = count
+        self.days = days
+        self.received_status = False
+        self.failure = None
         self.process = None
         self.thread = None
         self.stopping = threading.Event()
@@ -199,8 +208,12 @@ class SSHSource:
              "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2", "--", self.host, REMOTE_COMMAND],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True, bufsize=1, start_new_session=True)
-        self.process.stdin.write(json.dumps({"operation": "live", "job_id": self.state.job_id,
-                                             "interval": self.state.interval}) + "\n")
+        request = {"operation": "live", "job_id": self.state.job_id, "interval": self.state.interval}
+        if self.count is not None:
+            request["count"] = self.count
+        if self.days != 30:
+            request["days"] = self.days
+        self.process.stdin.write(json.dumps(request) + "\n")
         self.process.stdin.close()
         self.thread = threading.Thread(target=self._read, daemon=True)
         self.thread.start()
@@ -221,20 +234,29 @@ class SSHSource:
                     break
                 if len(line) > MAX_EVENT_LINE or not line.endswith("\n"):
                     raise JobmonError("Oversized or unfinished live event.")
-                self.state.apply(json.loads(line))
+                event = json.loads(line)
+                self.state.apply(event)
+                if event.get("event") == "status":
+                    self.received_status = True
             status = self.process.wait()
             stderr.join(timeout=1)
-            if not self.stopping.is_set():
+            if not self.stopping.is_set() and (self.count is None or status != 0):
                 message = "Remote stream ended (SSH exit {})".format(status)
                 if diagnostics:
                     message += ": " + "; ".join(diagnostics)
                 if any("Unsupported transport operation" in line for line in diagnostics):
                     message += ". Update the reporter with hpc-jdeploy --apply."
                 self.state.disconnected(message)
+                if status != 0:
+                    self.failure = message
         except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, JobmonError) as exc:
             if not self.stopping.is_set():
-                self.state.disconnected("Remote stream error: " + str(exc))
-                self.process.terminate()
+                self.failure = "Remote stream error: " + str(exc)
+                self.state.disconnected(self.failure)
+                try:
+                    self.process.terminate()
+                except ProcessLookupError:
+                    pass
 
     def close(self):
         self.stopping.set()
@@ -360,8 +382,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def open_browser(url):
-    # A configured browser command may wait until its window closes. Keep HTTP
-    # serving independently, so that window can load and receive updates.
+    # Browser launchers may block until closed; serve HTTP independently.
     try:
         if not webbrowser.open(url):
             print("Open the printed URL in your browser.", file=sys.stderr)
@@ -376,12 +397,29 @@ def main(argv=None):
     parser.add_argument("--interval", type=int, default=5, help="remote saved-file refresh seconds")
     parser.add_argument("--port", type=int, default=0, help="local port; 0 chooses a free port")
     parser.add_argument("--no-browser", action="store_true", help="print the URL without opening it")
+    parser.add_argument("--zip", action="store_true", help="save CPU and memory ZIPs and exit")
+    parser.add_argument("--output-dir", default="downloads", help="private ZIP output directory")
+    parser.add_argument("--days", type=int, default=30, help="accounting lookback for ZIP export")
     args = parser.parse_args(argv)
     sources, server = [], None
     try:
         if not 1 <= args.interval <= 86400 or not 0 <= args.port <= 65535:
             raise JobmonError("Interval must be 1–86400 seconds and port must be 0–65535.")
+        if not 1 <= args.days <= 3650 or (args.zip and len(args.job_id) != 1):
+            raise JobmonError("ZIP export needs one job ID; days must be 1–3650.")
         state = MultiJobState(args.job_id, args.interval)
+        if args.zip:
+            source = SSHSource(state.jobs[0], args.host, count=1, days=args.days)
+            sources.append(source)
+            source.start()
+            source.thread.join(timeout=SNAPSHOT_TIMEOUT)
+            if source.thread.is_alive():
+                raise JobmonError("Timed out waiting for a complete saved-history snapshot; retry the export.")
+            if source.failure or not source.received_status:
+                raise JobmonError(source.failure or "Remote stream ended before a complete history snapshot arrived.")
+            for path in write_exports(state.snapshot(), args.output_dir):
+                print(path, flush=True)
+            return 0
         sources = [SSHSource(job, args.host) for job in state.jobs]
         server = DashboardServer(state, args.port)
         for source in sources:
@@ -400,7 +438,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         return 130
     except (OSError, JobmonError, ValueError) as exc:
-        print("hpc-live: " + str(exc), file=sys.stderr)
+        print(("hpc-jreport: " if args.zip else "hpc-live: ") + str(exc), file=sys.stderr)
         return 2
     finally:
         if server is not None:

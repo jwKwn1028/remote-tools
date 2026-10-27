@@ -1,49 +1,40 @@
 #!/bin/sh
-# Remote ~/.config/jobmon/env.sh. Keep machine-specific values private.
-# Create/edit this on the cluster; chmod 600 the file and chmod 700 its directory.
-# Use POSIX shell syntax, produce no output, and start no watchers or collectors.
-# Load existing site modules quietly here only if needed; install no packages.
-# Defaults preserve settings already exported for a particular job.
+# Remote ~/.config/jobmon/env.sh: private file (600), directory (700).
+# Use POSIX syntax; no output, watchers, collectors, or package installs.
+# Load existing site modules quietly if needed. Defaults preserve exported values.
 
-# 1. Existing Python 3.8+: one executable name/path, without extra arguments.
-# Replace python3 with a verified absolute path when needed on compute nodes.
+# Python 3.8+: one executable, no arguments; verify it on compute nodes.
 export JOBMON_PYTHON="${JOBMON_PYTHON:-python3}"
 
-# 2. Absolute private storage path shared by login and ALL allocation nodes.
-# Relative JOBMON_DATA_DIR values are rejected. Replace the fallback if needed.
+# Absolute private storage shared by login and all allocation nodes.
 export JOBMON_DATA_DIR="${JOBMON_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/jobmon}"
 
-# 3. Batch-wrapper sampling interval: 1 to 86400 seconds (fractions allowed).
-# Direct collect.py calls use --interval; this does not change watch refreshes.
+# Wrapper sampling: 1-86400 seconds, fractions allowed; separate from watch refreshes.
+# Direct collect.py calls use --interval.
 export JOBMON_INTERVAL="${JOBMON_INTERVAL:-60}"
 
-# 4. Optional GPU mapping: unique full UUIDs, verified for THIS allocation/node.
-# Unset means no GPU samples. Numeric ordinals and MIG UUIDs are unsupported.
-# For multiple nodes, supply the correct mapping in each node's launch environment.
-# Do not keep a previous job's GPU list in this global file.
+# Optional GPU mapping: unique full UUIDs verified per allocation/node.
+# Unset disables GPU samples; numeric ordinals and MIG UUIDs are unsupported.
+# Supply per-node mappings at launch; never retain a previous job's list here.
 # export JOBMON_GPU_UUIDS=GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
 
-# 5. GPU attribution switch: default disabled; only the exact value 1 enables it.
-# Set 1 only after verifying exclusive use without sharing, MPS, or MIG.
-# Detected MIG prevents exclusive attribution even with this switch enabled.
+# GPU attribution: only 1 enables it; requires exclusive use without sharing/MPS/MIG.
+# Detected MIG blocks attribution even with this enabled.
 # export JOBMON_GPU_EXCLUSIVE=1
 
-# 6. Multi-node example-launcher switch: default 0 (disabled); set 1 only after
-# site validation of the concurrent srun --overlap step. Single-node runs ignore it.
+# Multi-node launcher: default 0; set 1 after site validation of srun --overlap.
+# Ignored on single-node runs.
 # export JOBMON_ALLOW_OVERLAP=1
 
-# 7. Process-tree fallback switch: default disabled; only the exact value 1
-# enables it. Set 1 ONLY where Slurm creates no job cgroup (ProctrackType is not
-# proctrack/cgroup and TaskPlugin is not task/cgroup). Results are an
-# approximation scoped to the batch process group, not cgroup measurements: the
-# workload must run directly in the batch script, because srun/mpirun steps and
-# anything calling setsid/setpgid leave the group uncounted.
+# Process-tree fallback: only 1 enables it; requires no Slurm job cgroup
+# (neither proctrack/cgroup nor task/cgroup). Approximate batch-group measurements:
+# run workloads directly in the batch script; srun/mpirun and setsid/setpgid
+# can leave the group uncounted.
 # export JOBMON_PROCESS_TREE=1
 
-# 8. Advanced: collector script path used by the batch wrapper, on every node.
-# This does not change the SSH reporter's fixed installation path.
+# Collector path on every node; the SSH reporter's installation path stays fixed.
 # export JOBMON_COLLECTOR="${JOBMON_COLLECTOR:-$HOME/.local/libexec/jobmon/collect.py}"
 
-# JOBMON_RUN_DIR and SLURM_* are runtime-provided values, not configuration.
-# HPC_JOBMON_HOST and HPC_JOBMON_TOOLS_DIR belong in local workstation zsh.
-# Watch --interval, report --days, --json, and watch --count are CLI options.
+# JOBMON_RUN_DIR and SLURM_* are supplied at runtime.
+# HPC_JOBMON_HOST and HPC_JOBMON_TOOLS_DIR belong in workstation zsh.
+# Watch/report options belong on the command line.

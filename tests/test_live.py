@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "jobmon"))
@@ -126,6 +127,34 @@ class LiveStateTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(JobmonError):
                 state.apply(event)
         self.assertEqual(state.snapshot(), before)
+
+    def test_wrapper_completion_is_validated_per_run_and_retained_after_disconnect(self):
+        state = self.state()
+        status = dict(events()[-1], scheduler=None)
+        completion = {"job_id": JOB_ID, "run_id": RUN_ID, "workload_exit_code": 0}
+
+        def finish(value, run_id=RUN_ID):
+            state.apply(dict(status, runs=[{"run_id": run_id, "completion": value, "errors": []}]))
+
+        for invalid in ([], {}, dict(completion, job_id="999"), dict(completion, run_id="foreign-run"),
+                        dict(completion, workload_exit_code=True), dict(completion, workload_exit_code="0")):
+            with self.subTest(invalid=invalid):
+                finish(invalid)
+                self.assertIsNone(state.snapshot()["runs"][0]["exit_code"])
+        # A final collector sample is not a wrapper completion record.
+        state.apply(events([dict(sample(90, 60), final=True)])[1])
+        self.assertIsNone(state.snapshot()["runs"][0]["exit_code"])
+        for code in (0, 1, 137):
+            finish(dict(completion, workload_exit_code=code))
+            self.assertEqual(state.snapshot()["runs"][0]["exit_code"], code)
+        state.disconnected("synthetic connection lost")
+        self.assertEqual(state.snapshot()["runs"][0]["exit_code"], 137)
+        second = "20260902T000000Z-r1-abcdef012345"
+        state.apply(dict(events()[0], metadata=metadata(second)))
+        runs = state.snapshot()["runs"]
+        self.assertEqual(runs[0]["exit_code"], 137)
+        self.assertIsNone(runs[1]["exit_code"])
+        self.assertEqual(state.snapshot()["scheduler"]["queue"][0]["state"], "RUNNING")
 
     def test_disconnected_stream_retains_history_and_stale_stream_is_labelled(self):
         state = self.state()
@@ -358,6 +387,92 @@ class SSHAndShellTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+
+    def zip_ssh(self, packets, status=0, delay=0):
+        fixture = self.base / "zip-events.jsonl"
+        fixture.write_text("".join(json.dumps(packet) + "\n" for packet in packets))
+        capture = self.base / "zip-request.json"
+        fake = self.base / "ssh"
+        fake.write_text("#!" + sys.executable + "\nimport json,os,pathlib,sys,time\n"
+                        "pathlib.Path(os.environ['CAPTURE']).write_text(json.dumps({'args':sys.argv[1:],"
+                        "'request':json.loads(sys.stdin.read())}))\n"
+                        "sys.stdout.write(pathlib.Path(os.environ['EVENTS']).read_text());sys.stdout.flush()\n"
+                        "time.sleep(" + str(delay) + ")\nsys.exit(" + str(status) + ")\n")
+        fake.chmod(0o700)
+        env = {key: value for key, value in os.environ.items() if not key.startswith("HPC_JOBMON_")}
+        env.update(PATH=str(self.base) + os.pathsep + os.environ["PATH"], CAPTURE=str(capture), EVENTS=str(fixture),
+                   HPC_JOBMON_HOST="test-alias")
+        return env, capture
+
+    def test_report_zip_shell_downloads_a_complete_snapshot_and_both_charts(self):
+        rows = [sample(0), sample(30, 0, memory=None), sample(60, 120)]
+        rows[0]["large_counter"] = 2 ** 60 + 1
+        packets = events(rows)
+        packets[0]["metadata"]["job_name"] = "synthetic simulation α"
+        packets[-1]["runs"] = [{"run_id": RUN_ID, "completion": {
+            "job_id": JOB_ID, "run_id": RUN_ID, "workload_exit_code": 0}, "errors": []}]
+        env, capture = self.zip_ssh(packets)
+        destination = self.base / "saved exports"
+        result = subprocess.run(["zsh", "-f", "-c",
+                                 'source "$1"; hpc-jreport 123_7 --zip --output-dir "$2" --days 90',
+                                 "test", str(ROOT / "shell/jobmon.zsh"), str(destination)],
+                                env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        paths = [Path(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(paths), 2)
+        self.assertNotIn("http://", result.stdout)
+        for path, chart in zip(paths, ("cpu", "memory")):
+            self.assertTrue(path.name.startswith("jobmon-123_7-synthetic-simulation-α-" + RUN_ID + "-node1-" + chart))
+            with zipfile.ZipFile(path) as package:
+                saved = json.loads(package.read("data.json"))
+                self.assertEqual(saved["chart"], chart)
+                self.assertEqual(saved["workload_exit_code"], 0)
+                self.assertEqual(len(saved["points"]), 3)
+                self.assertTrue(saved["raw_samples_complete"])
+                self.assertFalse(any("Remote stream ended" in item for item in saved["diagnostics"]))
+                raw = [json.loads(line) for line in package.read("samples.jsonl").splitlines()]
+                self.assertEqual(raw, rows)
+                self.assertEqual(raw[0]["large_counter"], 2 ** 60 + 1)
+        request = json.loads(capture.read_text())
+        self.assertEqual(request["request"], {"operation": "live", "job_id": JOB_ID,
+                                             "interval": 5, "count": 1, "days": 90})
+        self.assertEqual(request["args"][-1], live.REMOTE_COMMAND)
+
+    def test_zip_mode_never_opens_a_browser_or_local_server(self):
+        env, _ = self.zip_ssh(events())
+        with patch.dict(os.environ, env), patch.object(live, "DashboardServer") as server, \
+                patch.object(live.webbrowser, "open") as browser, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(live.main([JOB_ID, "--host", "test-alias", "--zip",
+                                        "--output-dir", str(self.base / "zip")]), 0)
+        server.assert_not_called()
+        browser.assert_not_called()
+
+    def test_zip_mode_rejects_failed_partial_and_timed_out_snapshots(self):
+        for label, packets, status, delay in (("failed", events(), 23, 0),
+                                              ("partial", events()[:-1], 0, 0),
+                                              ("empty", [events()[-1]], 0, 0),
+                                              ("timeout", [], 0, 10)):
+            with self.subTest(label=label):
+                env, _ = self.zip_ssh(packets, status, delay)
+                destination = self.base / label
+                with patch.dict(os.environ, env), patch.object(live, "SNAPSHOT_TIMEOUT", 0.2), \
+                        contextlib.redirect_stderr(io.StringIO()) as errors:
+                    result = live.main([JOB_ID, "--host", "test-alias", "--zip", "--output-dir", str(destination)])
+                self.assertEqual(result, 2, errors.getvalue())
+                self.assertFalse(destination.exists())
+                self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_zip_shell_rejects_invalid_options_before_connecting(self):
+        env, capture = self.zip_ssh(events())
+        for args in ("123_7 --zip --json", "123_7 --zip --days 0", "123_7 --zip --days 3651",
+                     "123_7 --zip --output-dir", "../invalid --zip", "123_7 --zip --interval 2"):
+            with self.subTest(args=args):
+                result = subprocess.run(["zsh", "-f", "-c", 'source "$1"; hpc-jreport ' + args,
+                                         "test", str(ROOT / "shell/jobmon.zsh")],
+                                        env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(capture.exists())
+                self.assertFalse(result.stdout)
 
     def test_single_fixed_ssh_command_json_stdin_and_clean_shutdown(self):
         capture = self.base / "request.json"

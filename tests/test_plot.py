@@ -14,6 +14,7 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -147,29 +148,43 @@ const context={byId:id=>controls[id],ns:"http://www.w3.org/2000/svg",
   memory:[["memory","Current","blue"],["memory_peak","Sampled maximum","orange"]]}};
 vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],"utf8"),context);
 const point=(time,cpu)=>({time,cpu,average:cpu,maximum:cpu,memory:1,memory_peak:1});
+const rendered=[];
+function render(id,points){
+ context.chart(id,points);rendered.push({id,points,
+  paths:controls[id].children.filter(child=>child.tag==="path").map(child=>child.attrs.d),
+  labels:controls[id].children.filter(child=>child.tag==="text").map(child=>String(child.textContent))});
+}
 const reference=()=>controls.cpu.children.find(child=>child.attrs["data-reference"]==="100-percent");
 const labels=()=>controls.cpu.children.filter(child=>child.tag==="text" && child.attrs.x===64)
  .map(child=>child.textContent);
-context.chart("cpu",[point(0,50),point(30000,100)]);
+render("cpu",[point(0,50),point(30000,100)]);
 assert.deepEqual(labels(),["0%","25%","50%","75%","100%"]);
 assert.equal(reference().attrs.y1,16);
-context.chart("cpu",[point(0,50),point(30000,160)]);
+render("cpu",[point(0,50),point(30000,160)]);
 assert.ok(reference().attrs.y1>16 && reference().attrs.y1<236);
 assert.ok(controls.cpu.children.some(child=>child.tag==="text" && child.textContent==="100%"));
 const path=controls.cpu.children.find(child=>child.tag==="path").attrs.d;
 const coordinates=Array.from(path.matchAll(/[ML]([\d.]+),([\d.]+)/g),match=>Number(match[2]));
 assert.ok(coordinates.every(y=>y>=16 && y<=236));
 assert.ok(coordinates[1]<reference().attrs.y1,"usage above 100% remains above the reference");
-context.chart("cpu",[{...point(0,null),memory:null,memory_peak:null}]);
+render("cpu",[{...point(0,null),memory:null,memory_peak:null}]);
 assert.deepEqual(labels(),["0%","25%","50%","75%","100%"]);
 assert.ok(controls.cpu.children.some(child=>child.textContent==="No available measurements"));
-context.chart("memory",[point(0,100)]);
+render("memory",[point(0,100)]);
 assert.ok(!controls.memory.children.some(child=>child.attrs["data-reference"]));
 assert.ok(!controls.memory.children.some(child=>String(child.textContent||"").includes("%")));
+render("cpu",[point(0,50),point(30000,null),{...point(90000,100),gap:true}]);
+process.stdout.write(JSON.stringify(rendered));
 """
         result = subprocess.run(["node", "-e", javascript, str(script)],
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
+        for rendered in json.loads(result.stdout):
+            points = [dict(point, gap=point.get("gap", False)) for point in rendered["points"]]
+            svg = ET.fromstring(jobplot.svg_chart(rendered["id"], points, axis="elapsed"))
+            namespace = {"s": "http://www.w3.org/2000/svg"}
+            self.assertEqual([path.attrib["d"] for path in svg.findall("s:path", namespace)], rendered["paths"])
+            self.assertEqual([label.text for label in svg.findall("s:text", namespace)], rendered["labels"])
         self.assertIn('<h1 id="title">Job history</h1>', jobplot.HTML)
         self.assertNotIn("hpc-live", jobplot.HTML)
 
@@ -254,7 +269,7 @@ class Element{
 }
 for(const id of ["data","run","node","axis","title","runtime","connection","context","scheduler","scope",
  "diagnostics","notice","cpu","memory","cpu-reading","memory-reading","cpu-legend","memory-legend",
- "sidebar","sidebar-toggle","job-tabs","job-panel","export-status"]){
+ "sidebar","sidebar-toggle","job-tabs","job-panel","export-status","completion"]){
  const item=new Element(["run","node","axis"].includes(id)?"select":"div");item.id=id;
 }
 elements.sidebar.parentElement=new Element("main");elements.axis.value="clock";
@@ -270,6 +285,7 @@ vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[2],"utf8"
 const click=id=>elements["job-tab-"+id].onclick();
 assert.equal(connections.length,1);assert.equal(elements["job-tabs"].hidden,false);
 assert.equal(elements["job-tabs"].children.length,2);
+assert.equal(elements.completion.hidden,true);
 elements.run.value="0";elements.run.onchange();elements.node.value="1";elements.node.onchange();
 elements.axis.value="elapsed";elements.axis.onchange();elements["sidebar-toggle"].onclick();
 click("456_2");assert.match(document.title,/456_2 \(second simulation α\)/);
@@ -294,6 +310,40 @@ assert.equal(Number(elements.run.value),1,"second job keeps its latest run");
 assert.equal(Number(elements.node.value),0,"second job keeps its own node");
 const other=JSON.parse(context.exportFiles("memory").files.find(([name])=>name==="data.json")[1]);
 assert.equal(other.job_id,"456_2");assert.equal(elements.diagnostics.textContent,"second job diagnostic");
+// A quiet/disconnected stream and final samples alone are not completion.
+next.jobs[1].version++;next.jobs[1].connection="Remote stream ended";
+next.jobs[1].runs[1].nodes[0].points.at(-1).final=true;
+connections[0].onmessage({data:JSON.stringify(next)});
+assert.equal(elements.completion.hidden,true);
+// A background completion updates its tab without disturbing this job's chart.
+const activePath=elements.cpu.children.find(child=>child.tag==="path");
+next.jobs[0].version++;next.jobs[0].runs[1].exit_code=0;
+connections[0].onmessage({data:JSON.stringify(next)});
+assert.equal(elements.cpu.children.find(child=>child.tag==="path"),activePath);
+assert.match(elements["job-tab-"+initial.jobs[0].job_id].textContent,/ · finished/);
+assert.equal(elements["job-tab-"+initial.jobs[0].job_id].className,"finished");
+click(initial.jobs[0].job_id);
+assert.equal(elements.completion.hidden,true,"an older unfinished selected run has no completion");
+elements.run.value="1";elements.run.onchange();
+assert.equal(elements.completion.hidden,false);
+assert.match(elements.completion.textContent,/Workload finished \(exit 0\)/);
+assert.match(elements.completion.textContent,/final Slurm state/);
+assert.equal(elements.completion.className,"finished");
+for(const code of [1,137]){
+ next.jobs[0].version++;next.jobs[0].runs[1].exit_code=code;
+ connections[0].onmessage({data:JSON.stringify(next)});
+ assert.equal(elements.completion.className,"failed");
+ assert.match(elements.completion.textContent,new RegExp('code '+code));
+ assert.match(elements.completion.textContent,/output\/error logs/);
+ assert.match(elements["job-tab-"+initial.jobs[0].job_id].textContent,new RegExp(' · exit '+code+' '));
+}
+const requeue=JSON.parse(JSON.stringify(next.jobs[0].runs[1]));requeue.run_id="new-requeued-run";requeue.exit_code=null;
+next.jobs[0].runs.push(requeue);next.jobs[0].version++;
+connections[0].onmessage({data:JSON.stringify(next)});
+assert.equal(elements.completion.hidden,true,"a new run clears the old completion banner");
+assert.ok(!elements["job-tab-"+initial.jobs[0].job_id].textContent.includes(' · exit'));
+elements.run.value="1";elements.run.onchange();
+assert.equal(elements.completion.hidden,false,"older completion remains available in its run");
 connections[0].onmessage({data:JSON.stringify(next.jobs[0])});
 assert.equal(elements["job-tabs"].hidden,true,"one job needs no tab bar");
 assert.equal(elements["job-panel"].attrs.role,undefined);
@@ -322,7 +372,7 @@ assert.equal(connections.length,1);listeners.pagehide();assert.equal(connections
         # Exercise the actual click handler and ZIP writer without requiring a GUI.
         code = ("function crc32(bytes){"
                 + jobplot.HTML.split("function crc32(bytes){", 1)[1].split("update(data);", 1)[0])
-        export_script.write_text(code)
+        export_script.write_text("const exportSpec=" + json.dumps(jobplot.EXPORT_SPEC) + ";\n" + code)
         javascript = r"""
 const fs=require("node:fs"),vm=require("node:vm");
 const data=JSON.parse(fs.readFileSync(process.argv[1],"utf8")), downloads=[],blobs=[];
@@ -361,6 +411,8 @@ Promise.all(downloads.map(async result=>({filename:result.filename,
         exported = json.loads(result.stdout)
         downloads = exported["downloads"]
         safe_names = ["check_df_eri", "bad-name-with-spaces", "unnamed", "unnamed", "unnamed", "가" * 21]
+        unsafe_names = ["check_df_eri", '../../bad\\name:with?*<>|" spaces\x00', None, "", "...///", "가" * 200]
+        self.assertEqual([jobplot.filename_part(name, 64) for name in unsafe_names], safe_names)
         for filename, name in zip(exported["filenames"], safe_names):
             self.assertTrue(filename.startswith("jobmon-" + JOB_ID + "-" + name + "-" + second + "-node2-cpu-"))
             self.assertLessEqual(len(filename.encode("utf-8")), 240)
@@ -383,6 +435,23 @@ Promise.all(downloads.map(async result=>({filename:result.filename,
                 self.assertEqual(saved["units"]["memory"], "GiB")
                 self.assertEqual(saved["time_axis"], "elapsed")
                 self.assertEqual(len(saved["points"]), 3 if index == 0 else 4)
+                local_data = json.loads(fixture.read_text())
+                local_run = local_data["runs"][1]
+                local_node = local_run["nodes"][1]
+                if index:
+                    extra = dict(local_node["points"][-1], time=local_node["points"][-1]["time"] + 30000)
+                    local_node["points"].append(extra)
+                if index == 2:
+                    for point in local_node["points"]:
+                        point.pop("raw_sample")
+                filename, local_files = jobplot.export_files(local_data, local_run, local_node, chart,
+                    captured=saved["exported_at"], axis="elapsed", timezone_name=saved["timezone"])
+                local_files = dict(local_files)
+                self.assertEqual(filename, download["filename"])
+                self.assertEqual(json.loads(local_files["data.json"]), saved)
+                self.assertEqual(local_files["data.csv"].encode(), package.read("data.csv"))
+                if index < 2:
+                    self.assertEqual(local_files["samples.jsonl"].encode(), package.read("samples.jsonl"))
                 prefix = "jobmon-" + JOB_ID + "-synthetic-simulation-α-" + second + "-node2-" + chart
                 self.assertTrue(download["filename"].startswith(prefix))
                 self.assertIn(chart + " · α", package.read("chart.svg").decode())
@@ -418,6 +487,78 @@ Promise.all(downloads.map(async result=>({filename:result.filename,
         self.assertTrue(points[-1]["gap"])
         self.assertIsNone(points[-1]["cpu"])
         self.assertIsNone(result["runs"][1]["nodes"][0]["points"][0]["average"])
+
+    def test_terminal_zip_exports_every_run_and_node_with_private_complete_files(self):
+        meta = dict(metadata(), job_name="synthetic simulation α", expected_nodes=["node1", "node2"],
+                    expected_node_count=2, allocated_cpus_by_node={"node1": 4, "node2": 4})
+        rows = [sample(0), sample(30, 0, memory=None), sample(60, 120)]
+        rows[0]["large_counter"] = 2 ** 60 + 1
+        files = entries(rows, meta=meta)
+        files.append((JOB_ID + "/" + RUN_ID + "/node2--abcdef012345.jsonl",
+                      (json.dumps(sample(0, node="node2", stream="node2--abcdef012345")) + "\n").encode()))
+        second = "20260902T000000Z-r1-abcdef012345"
+        files += entries([sample(0, run_id=second)], run_id=second)
+        data = self.load(files)
+        destination = self.base / "downloads"
+        outputs = jobplot.write_exports(data, destination)
+        self.assertEqual(len(outputs), 6)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(set(destination.iterdir()), set(outputs))
+        for path in outputs:
+            with self.subTest(path=path.name), zipfile.ZipFile(path) as bundle:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(set(bundle.namelist()), {"chart.svg", "data.csv", "data.json", "samples.jsonl"})
+                self.assertIsNone(bundle.testzip())
+                self.assertTrue(all(info.external_attr >> 16 & 0o777 == 0o600 for info in bundle.infolist()))
+                saved = json.loads(bundle.read("data.json"))
+                self.assertEqual(saved["job_id"], JOB_ID)
+                self.assertTrue(saved["raw_samples_complete"])
+                self.assertIn("-" + saved["node"] + "-" + saved["chart"] + "-", path.name)
+                original = [json.loads(line) for line in bundle.read("samples.jsonl").splitlines()]
+                self.assertEqual(len(original), len(saved["points"]))
+                self.assertTrue(all(row["run_id"] == saved["run_id"] and row["node"] == saved["node"]
+                                    for row in original))
+                svg = ET.fromstring(bundle.read("chart.svg"))
+                namespace = {"s": "http://www.w3.org/2000/svg"}
+                paths = svg.findall("s:path", namespace)
+                self.assertEqual(len(paths), 3 if saved["chart"] == "cpu" else 2)
+                if saved["chart"] == "cpu":
+                    self.assertIn("100%", [text.text for text in svg.findall("s:text", namespace)])
+                if saved["run_id"] == RUN_ID and saved["node"] == "node1":
+                    self.assertEqual(original[0]["large_counter"], 2 ** 60 + 1)
+                    table = list(csv.DictReader(io.StringIO(bundle.read("data.csv").decode())))
+                    self.assertEqual(table[1]["cpu_percent"], "0")
+                    self.assertEqual(table[1]["memory_gib"], "")
+
+    def test_terminal_export_rejects_unsafe_destinations_and_leaves_no_partial_zip(self):
+        data = self.load()
+        missing = self.base / "not-created"
+        with self.assertRaises(JobmonError):
+            jobplot.write_exports(dict(data, job_id="../invalid"), missing)
+        with self.assertRaisesRegex(JobmonError, "No saved samples"):
+            jobplot.write_exports(dict(data, runs=[]), missing)
+        self.assertFalse(missing.exists())
+        directory = self.base / "private"
+        directory.mkdir(mode=0o700)
+        linked = self.base / "linked"
+        linked.symlink_to(directory, target_is_directory=True)
+        with self.assertRaises(JobmonError):
+            jobplot.write_exports(data, linked)
+        directory.chmod(0o755)
+        with self.assertRaises(JobmonError):
+            jobplot.write_exports(data, directory)
+        directory.chmod(0o700)
+        old = directory / "jobmon-existing.zip"
+        old.write_bytes(b"existing export")
+        with patch.object(jobplot, "export_files", return_value=(old.name, [("chart.svg", "<svg/>")])), \
+                self.assertRaises(FileExistsError):
+            jobplot.write_exports(data, directory)
+        self.assertEqual(old.read_bytes(), b"existing export")
+        self.assertEqual(list(directory.iterdir()), [old])
+        with patch.object(zipfile.ZipFile, "writestr", side_effect=OSError("synthetic disk failure")), \
+                self.assertRaisesRegex(OSError, "synthetic disk failure"):
+            jobplot.write_exports(data, directory)
+        self.assertEqual(list(directory.iterdir()), [old])
 
     def test_malformed_and_partial_samples_do_not_erase_valid_history(self):
         files = entries()
