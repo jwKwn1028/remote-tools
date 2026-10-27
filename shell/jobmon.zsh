@@ -204,13 +204,15 @@ hpc-jreport() { emulate -L zsh; _jobmon_request report "$@"; }
 hpc-live() {
   emulate -L zsh
   local job_id='' interval=5 port=0 host REPLY option value
+  local job_pattern='^[1-9][0-9]*(_[0-9]+)?$'
   local tools_dir=${HPC_JOBMON_TOOLS_DIR:-${_jobmon_bundle_dir:-}}
-  local -a options
+  local -a options fields
+  local -aU job_ids
   while (( $# )); do
     case $1 in
       -h|--help)
         print -r -- 'Usage: hpc-live [JOB_ID] [--interval SECONDS] [--port PORT] [--no-browser]'
-        print -r -- 'Without an ID, choose a running job. Opens a local browser dashboard of live saved samples.'
+        print -r -- 'Without an ID, opens all running jobs as tabs in one local browser dashboard.'
         return 0
         ;;
       --interval|--port)
@@ -228,7 +230,6 @@ hpc-live() {
         ;;
       --no-browser) options+=(--no-browser); shift ;;
       *)
-        local job_pattern='^[1-9][0-9]*(_[0-9]+)?$'
         if [[ -n $job_id || ! $1 =~ $job_pattern || ${#1} -gt 40 ]]; then
           print -u2 -- 'Usage: hpc-live [JOB_ID] [--interval SECONDS] [--port PORT] [--no-browser]'
           return 2
@@ -247,12 +248,33 @@ hpc-live() {
     return 2
   fi
   if [[ -z $job_id ]]; then
-    _jobmon_choose_job view || return
-    job_id=$REPLY
+    local output line
+    local -i others=0
+    output=$(_jobmon_request jobs) || return
+    for line in ${(f)output}; do
+      fields=("${(@ps:\t:)line}")
+      [[ $fields[1] == 'JOB ID' ]] && continue
+      if [[ $fields[2] == (RUNNING|COMPLETING) ]]; then
+        if [[ ! $fields[1] =~ $job_pattern || ${#fields[1]} -gt 40 ]]; then
+          print -u2 -- 'jobmon: invalid job ID in the running jobs response.'
+          return 2
+        fi
+        job_ids+=("$fields[1]")
+      else
+        (( ++others ))
+      fi
+    done
+    if (( ! ${#job_ids} )); then
+      print -u2 -- "jobmon: no running jobs to view ($others queued or not running)."
+      return 1
+    fi
+  else
+    job_ids=("$job_id")
   fi
   _jobmon_host || return
   host=$REPLY
-  command python3 "$tools_dir/jobmon/live.py" "$job_id" --host "$host" --interval "$interval" --port "$port" "${options[@]}"
+  command python3 "$tools_dir/jobmon/live.py" "${job_ids[@]}" --host "$host" \
+    --interval "$interval" --port "$port" "${options[@]}"
 }
 
 hpc-jdeploy() {

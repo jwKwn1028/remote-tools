@@ -25,9 +25,11 @@ from slurm_backend import JobmonError, identity
 from test_plot import JOB_ID, RUN_ID, STREAM, metadata, sample
 
 
-def events(rows=None):
+def events(rows=None, job_id=JOB_ID):
     rows = rows if rows is not None else [sample(0), sample(30, 60), sample(60, 120)]
-    meta = metadata()
+    raw_id = job_id.split("_", 1)[0]
+    rows = [dict(row, job_id=job_id, job_id_raw=raw_id) for row in rows]
+    meta = dict(metadata(), job_id=job_id, job_id_raw=raw_id)
     history = jobmon.RunHistory(Path(RUN_ID), meta)
     result = [{"event": "run", "metadata": meta}]
     for row in rows:
@@ -37,7 +39,7 @@ def events(rows=None):
     result.append({"event": "status", "generated_at": "2026-09-01T00:01:00+00:00",
                    "scheduler_snapshot_at": "2026-09-01T00:01:00+00:00",
                    "scheduler": {"queue": [{"state": "RUNNING"}], "errors": []}, "runs": []})
-    return [dict(event, job_id=JOB_ID, schema_version=1) for event in result]
+    return [dict(event, job_id=job_id, schema_version=1) for event in result]
 
 
 class LiveStateTests(unittest.TestCase):
@@ -76,6 +78,44 @@ class LiveStateTests(unittest.TestCase):
         self.assertFalse(points[1]["gap"])
         self.assertTrue(points[2]["gap"])
 
+    def test_runtime_uses_slurm_start_and_advances_only_with_saved_samples(self):
+        state = live.LiveState(JOB_ID)
+        packets = events()
+        packets[0]["metadata"]["created_at"] = "2026-09-01T00:00:02+00:00"
+        packets[-1]["scheduler"]["queue"][0]["elapsed"] = "2:40:10"
+        for event in packets:
+            state.apply(event)
+        runtime = state.snapshot()["runs"][0]["runtime"]
+        self.assertEqual((runtime["source"], runtime["seconds"], runtime["display"]),
+                         ("slurm", 9610, "2:40:10"))
+        # File refreshes can advance while no new collector sample is saved.
+        status = dict(packets[-1], scheduler=None, generated_at="2026-09-01T00:02:00+00:00")
+        state.apply(status)
+        self.assertEqual(state.snapshot()["runs"][0]["runtime"], runtime)
+        state.apply(events([sample(90, 60)])[1])
+        updated = state.snapshot()["runs"][0]["runtime"]
+        self.assertEqual((updated["seconds"], updated["display"]), (9640, "2:40:40"))
+        state.disconnected("synthetic connection lost")
+        self.assertEqual(state.snapshot()["runs"][0]["runtime"], updated)
+
+    def test_runtime_keeps_requeues_separate_from_the_initial_slurm_snapshot(self):
+        state = live.LiveState(JOB_ID)
+        packets = events()
+        packets[0]["metadata"]["created_at"] = "2026-09-01T00:00:02+00:00"
+        packets[-1]["scheduler"]["queue"][0]["elapsed"] = "5:00"
+        for event in packets:
+            state.apply(event)
+        second = "20260901T000500Z-r1-abcdef012345"
+        meta = dict(metadata(second), created_at="2026-09-01T00:05:00+00:00")
+        state.apply(dict(packets[0], metadata=meta))
+        point = dict(packets[1]["point"], time=packets[1]["point"]["time"] + 330000)
+        state.apply(dict(packets[1], run_id=second, point=point,
+                         raw_sample=json.dumps(sample(330, run_id=second))))
+        runs = state.snapshot()["runs"]
+        # The initial snapshot still belongs to the older allocation.
+        self.assertEqual((runs[0]["runtime"]["source"], runs[0]["runtime"]["seconds"]), ("slurm", 300))
+        self.assertEqual((runs[1]["runtime"]["source"], runs[1]["runtime"]["seconds"]), ("monitoring", 30))
+
     def test_invalid_foreign_or_nonfinite_events_do_not_change_data(self):
         state = self.state()
         before = state.snapshot()
@@ -95,6 +135,50 @@ class LiveStateTests(unittest.TestCase):
         state.disconnected("synthetic connection lost")
         self.assertEqual(state.snapshot()["runs"], before)
         self.assertIn("synthetic connection lost", state.snapshot()["diagnostics"])
+
+
+class MultiJobStateTests(unittest.TestCase):
+    def test_each_job_notifies_the_shared_stream_and_retains_its_own_history(self):
+        state = live.MultiJobState([JOB_ID, "456_2"])
+        for job in state.jobs:
+            for event in events(job_id=job.job_id):
+                before = state.version
+                job.apply(event)
+                self.assertEqual(state.version, before + 1)
+        initial = state.snapshot()
+        self.assertEqual([job["job_id"] for job in initial["jobs"]], [JOB_ID, "456_2"])
+        state.jobs[1].apply(events([sample(90, 60)], job_id="456_2")[1])
+        updated = state.snapshot()
+        self.assertEqual(updated["jobs"][0], initial["jobs"][0])
+        self.assertEqual(len(updated["jobs"][1]["runs"][0]["nodes"][0]["points"]), 4)
+        version = state.version
+        with self.assertRaises(JobmonError):
+            state.jobs[0].apply(events(job_id="456_2")[1])
+        self.assertEqual(state.version, version)
+        state.jobs[1].disconnected("synthetic connection lost")
+        disconnected = state.snapshot()
+        self.assertEqual(disconnected["jobs"][0], initial["jobs"][0])
+        self.assertEqual(disconnected["jobs"][1]["runs"], updated["jobs"][1]["runs"])
+        self.assertIn("synthetic connection lost", disconnected["jobs"][1]["diagnostics"])
+        disconnected["jobs"][0]["runs"].clear()
+        self.assertTrue(state.snapshot()["jobs"][0]["runs"])
+
+    def test_one_job_preserves_the_existing_snapshot_shape(self):
+        state = live.MultiJobState([JOB_ID])
+        for event in events():
+            state.jobs[0].apply(event)
+        self.assertEqual(state.snapshot(), state.jobs[0].snapshot())
+        self.assertNotIn("jobs", state.snapshot())
+
+    def test_all_ids_are_validated_before_any_connection_or_server(self):
+        for ids in ([], [JOB_ID, JOB_ID], [JOB_ID, "../invalid"]):
+            with self.subTest(ids=ids), self.assertRaises(JobmonError):
+                live.MultiJobState(ids)
+        with patch.object(live, "SSHSource") as source, patch.object(live, "DashboardServer") as server, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(live.main([JOB_ID, "../invalid", "--host", "test-alias"]), 2)
+        source.assert_not_called()
+        server.assert_not_called()
 
 
 class RemoteStreamTests(unittest.TestCase):
@@ -242,6 +326,32 @@ class LocalServerTests(unittest.TestCase):
         self.server.service_actions()
         self.assertTrue(self.server.stopping.is_set())
 
+    def test_one_event_stream_updates_all_jobs_and_stops_after_browser_close(self):
+        group = live.MultiJobState([JOB_ID, "456_2"])
+        for job in group.jobs:
+            for event in events(job_id=job.job_id):
+                job.apply(event)
+        self.server.state = group
+        response = urlopen(self.server.url + "events", timeout=4)
+        self.addCleanup(response.close)
+
+        def update():
+            for _ in range(20):
+                line = response.readline().decode()
+                if line.startswith("data: "):
+                    return json.loads(line[6:])
+            self.fail("No multi-job SSE data")
+
+        initial = update()
+        self.assertEqual(len(initial["jobs"]), 2)
+        group.jobs[1].apply(events([sample(90, 60)], job_id="456_2")[1])
+        updated = update()
+        self.assertEqual(updated["jobs"][0], initial["jobs"][0])
+        self.assertEqual(len(updated["jobs"][1]["runs"][0]["nodes"][0]["points"]), 4)
+        self.assertEqual(self.server.sessions, 1)
+        response.close()
+        self.assertTrue(self.server.stopping.wait(timeout=3))
+
 
 class SSHAndShellTests(unittest.TestCase):
     def setUp(self):
@@ -306,6 +416,65 @@ class SSHAndShellTests(unittest.TestCase):
             server.return_value.serve_forever.side_effect = serve
             self.assertEqual(live.main([JOB_ID, "--host", "test-alias"]), 0)
             source.return_value.close.assert_called_once()
+
+    def test_main_starts_and_closes_every_job_and_isolates_a_failed_stream(self):
+        with patch.object(live, "DashboardServer") as server, patch.object(live, "SSHSource") as source, \
+                contextlib.redirect_stdout(io.StringIO()):
+            readers = []
+
+            def reader(state, host):
+                from unittest.mock import Mock
+                item = Mock(state=state)
+                if not readers:
+                    item.start.side_effect = OSError("synthetic SSH launch failure")
+                readers.append(item)
+                return item
+
+            source.side_effect = reader
+            self.assertEqual(live.main([JOB_ID, "456_2", "--host", "test-alias", "--no-browser"]), 0)
+            self.assertEqual([item.state.job_id for item in readers], [JOB_ID, "456_2"])
+            for item in readers:
+                item.start.assert_called_once()
+                item.close.assert_called_once()
+            group = server.call_args[0][0]
+            snapshots = group.snapshot()["jobs"]
+            self.assertIn("synthetic SSH launch failure", snapshots[0]["diagnostics"][0])
+            self.assertEqual(snapshots[1]["connection"], "Connecting")
+            server.return_value.serve_forever.assert_called_once()
+
+    def test_without_an_id_collects_all_started_jobs_noninteractively(self):
+        script = self.base / "clone/jobmon/live.py"
+        script.parent.mkdir(parents=True)
+        script.write_text("import json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+        fake = self.base / "ssh"
+        fake.write_text("#!" + sys.executable + "\nimport json,os,sys\n"
+                        "with open(os.environ['CAPTURE'],'a') as f: f.write(sys.stdin.read())\n"
+                        "sys.stdout.write(os.environ['JOBS_TABLE'])\n")
+        fake.chmod(0o700)
+        env = {key: value for key, value in os.environ.items() if not key.startswith("HPC_JOBMON_")}
+        capture = self.base / "requests.jsonl"
+        env.update(PATH=str(self.base) + os.pathsep + os.environ["PATH"], HPC_JOBMON_HOST="test-alias",
+                   HPC_JOBMON_TOOLS_DIR=str(script.parent.parent), CAPTURE=str(capture))
+        for rows, ids, status in (
+                ([("900_0", "RUNNING"), ("900_1", "COMPLETING"), ("900_2", "PENDING")], ["900_0", "900_1"], 0),
+                ([("900_0", "RUNNING"), ("900_0", "RUNNING")], ["900_0"], 0),
+                ([("900_2", "PENDING")], [], 1),
+                ([("900_0", "RUNNING"), ("../invalid", "RUNNING")], [], 2)):
+            with self.subTest(rows=rows):
+                table = "JOB ID\tSTATE\n" + "".join("\t".join(row) + "\n" for row in rows)
+                result = subprocess.run(["zsh", "-f", "-c", 'source "$1"; hpc-live --no-browser',
+                                         "test", str(ROOT / "shell/jobmon.zsh")],
+                                        env=dict(env, JOBS_TABLE=table), stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertNotIn("Choose a running job", result.stderr)
+                if ids:
+                    self.assertEqual(json.loads(result.stdout),
+                                     ids + ["--host", "test-alias", "--interval", "5", "--port", "0", "--no-browser"])
+                else:
+                    self.assertFalse(result.stdout)
+        requests = [json.loads(line) for line in capture.read_text().splitlines()]
+        self.assertEqual(requests, [{"operation": "jobs"}] * 4)
 
     def test_shell_name_options_and_clone_resolution_without_a_server(self):
         script = self.base / "clone/jobmon/live.py"

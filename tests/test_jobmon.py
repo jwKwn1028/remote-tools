@@ -1552,7 +1552,7 @@ class TransportTests(unittest.TestCase):
             if command == "hpc-live":
                 plotter = base / "tools/jobmon/live.py"
                 plotter.parent.mkdir(parents=True)
-                plotter.write_text("import sys\nprint('viewed ' + sys.argv[1])\n")
+                plotter.write_text("import sys\nprint('viewed ' + ' '.join(sys.argv[1:]))\n")
                 env["HPC_JOBMON_TOOLS_DIR"] = str(plotter.parent.parent)
             pid, fd = pty.fork()
             if pid == 0:
@@ -1606,29 +1606,18 @@ class TransportTests(unittest.TestCase):
         self.assertNotIn("Traceback", screen)
         self.assertEqual(requests, [])
 
-    def test_live_picker_uses_keys_and_passes_the_selected_id(self):
+    def test_live_opens_all_started_jobs_without_a_terminal_picker(self):
         table = self.job_table(("900_2", "PENDING"), ("900_0", "RUNNING", "first simulation"),
-                               ("900_1", "RUNNING", "second simulation"))
-        for keys, chosen in (([b"j", b"k", b"j", b"\n"], "900_1"),
-                             ([b"\x1b[B", b"\x1b[A", b"\r"], "900_0")):
-            with self.subTest(keys=keys):
-                screen, status, requests = self.pick(table, keys, command="hpc-live")
-                self.assertEqual(status, 0, screen)
-                self.assertIn("Choose a running job to view", screen)
-                self.assertIn("Enter: view", screen)
-                self.assertIn("second simulation", screen)
-                self.assertIn("viewed " + chosen, screen)
-                self.assertIn("terminal: isig echo", screen)
-                self.assertEqual(requests, [{"operation": "jobs"}])
+                               ("900_1", "COMPLETING", "second simulation"))
+        screen, status, requests = self.pick(table, command="hpc-live")
+        self.assertEqual(status, 0, screen)
+        self.assertNotIn("Choose a running job", screen)
+        self.assertNotIn("Enter: view", screen)
+        self.assertIn("viewed 900_0 900_1 --host", screen)
+        self.assertIn("terminal: isig echo", screen)
+        self.assertEqual(requests, [{"operation": "jobs"}])
 
-    def test_live_picker_cancel_and_single_or_no_running_jobs(self):
-        table = self.job_table(("900_0", "RUNNING"), ("900_1", "RUNNING"))
-        for key in (b"q", b"\x1b", b"\x03"):
-            with self.subTest(key=key):
-                screen, status, requests = self.pick(table, [key], command="hpc-live")
-                self.assertEqual(status, 130, screen)
-                self.assertEqual(requests, [{"operation": "jobs"}])
-                self.assertIn("terminal: isig echo", screen)
+    def test_live_single_or_no_running_jobs(self):
         screen, status, requests = self.pick(self.job_table(("900_0", "RUNNING")), command="hpc-live")
         self.assertEqual(status, 0, screen)
         self.assertNotIn("Choose a running job", screen)

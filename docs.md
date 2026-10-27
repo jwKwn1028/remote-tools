@@ -119,7 +119,7 @@ Run workstation commands after sourcing `shell/jobmon.zsh`:
 | `hpc-jwatch` | Choose a running job by ID and name. |
 | `hpc-jwatch 123456 --exit-on-completion` | Stop after wrapper completion and all final samples. |
 | `hpc-jfetch 123456 ./downloads` | Save a private history archive locally. |
-| `hpc-live` | Choose a running job and open its live CPU/memory dashboard. |
+| `hpc-live` | Open all running jobs in one dashboard with job tabs. |
 | `hpc-live 123456` | View a running or completed job from its earliest saved samples. |
 | `hpc-jstorage-init` | Create the login-side shared-storage probe once. |
 | `hpc-jdoctor` | Check interpreter, Slurm, wrapper, storage, and probe. |
@@ -295,7 +295,7 @@ samples. New collection errors appear once.
 | Column | Meaning |
 | --- | --- |
 | `CLOCK` | Sample capture time using the workstation's UTC offset at startup; direct cluster use shows cluster local time. |
-| `ELAPSED` | Runtime inferred from the initial Slurm snapshot; falls back to monitoring start when unavailable, as labelled. |
+| `ELAPSED` | Elapsed time inferred from the initial Slurm snapshot; falls back to monitoring start when unavailable, as labelled. |
 | `CPU LAST / AVG / MAX` | Latest interval, covered-interval average, and busiest interval, as percentages of allocated cores. |
 | `MEMORY / MEMORY MAX` | Current and largest sampled memory readings. |
 | `NODE` | Added for multi-node runs. |
@@ -346,28 +346,44 @@ future collection.
 ### Live browser dashboard
 
 ```zsh
-hpc-live                        # same j/k, arrows, Enter picker as hpc-jwatch
+hpc-live                        # all running jobs; switch with in-page tabs
 hpc-live 123456 --interval 5
 hpc-live 123456 --no-browser     # print the local URL for manual opening
 ```
 
-The command opens a local browser dashboard with a TokyoNight Storm theme.
+The command opens one local browser dashboard with a TokyoNight Storm theme.
+Without an ID, all jobs currently `RUNNING` or `COMPLETING` appear as in-page tabs
+labelled by ID and name. Click a tab, or focus one and use left/right arrows,
+Home, or End. One job needs no tab bar. Each job keeps its run, node, and time-axis
+selections, history, diagnostics, and exports. Every job keeps updating in the
+background; tab changes do not reload the page. Rerun the command to include jobs
+that start later. The terminal j/k and Enter picker remains in `hpc-jwatch` only.
 It loads the complete saved history from the beginning of each run, then appends
-new readings over one SSH connection. Samples from before the command started
-are included; time before collection began stays unmeasured. Slurm is queried
-once, while subsequent refreshes only read saved files.
+new readings over one SSH connection per job. Samples from before the command
+started are included; time before collection began stays unmeasured. Each job gets
+one initial Slurm snapshot; subsequent refreshes only read saved files.
 
 Deploy the updated reporter once with `hpc-jdeploy` and `hpc-jdeploy --apply`.
 The dashboard needs an existing local `python3` (3.8+), without extra packages.
 Its server binds only to loopback on a free port; `--port N` selects a port.
-Close the last dashboard tab or press Ctrl-C to stop viewing; collection continues.
+Close the last dashboard browser tab or press Ctrl-C to stop all viewing streams;
+collection continues. Switching in-page job tabs keeps the dashboard open.
 Tab closure has a 0.5-second grace period; normal CLI return takes about 1–2 seconds,
 including disconnect detection and SSH cleanup. Reloading within the grace keeps it open.
 `--interval` changes file refreshes (default 5 seconds), not the job's sampling rate.
 
 Choose a run and node, switch between local clock time and time since the first
-sample, and hover or tap for values. CPU shows latest, average, and maximum usage;
-memory shows current and sampled peak GiB. Gaps remain gaps, process-group scope
+sample, and hover or tap for values. The sidebar icon in the top bar hides or
+restores the controls and diagnostics without changing your selection.
+Graphs fill the available window width and expand when the sidebar is hidden.
+The header shows **Elapsed** through the selected run's latest saved sample,
+using the same Slurm start calculation as `hpc-jwatch`. It updates with new samples
+and stays fixed during gaps or disconnections. **Monitored** means time since
+monitoring started; **Sample span** means the start time is missing. Both are
+labelled fallbacks, and runs/requeues retain their own times.
+CPU shows latest, average, and maximum usage with a 100% allocation reference;
+readings above 100% remain visible. The heading and browser tab identify the job.
+Memory shows current and sampled peak GiB. Gaps remain gaps, process-group scope
 stays labelled, and nodes/requeues stay separate. New data updates automatically;
 disconnections keep existing plots visible with a diagnostic. Use an explicit ID
 for completed jobs. Each **Save image + data** button downloads one ZIP for the

@@ -3,13 +3,15 @@
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import sys
 import tarfile
 
 from collect import SCHEMA_VERSION, checked_name, private_open
-from jobmon import MAX_LINE, MEMORY_SCOPE_NOTES, RunHistory, sample_point, timestamp_seconds
+from jobmon import (MAX_LINE, MEMORY_SCOPE_NOTES, RunHistory, display_elapsed, run_start,
+                    sample_point, timestamp_seconds)
 from slurm_backend import JobmonError, validate_job_id
 
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
@@ -152,8 +154,38 @@ def plot_data(job_id, runs, errors):
                        "nodes": [nodes[node] for node in sorted(nodes)]})
     if not any(node["points"] for run in result for node in run["nodes"]):
         raise JobmonError("No valid saved samples to plot. " + "; ".join(sorted(errors)[:5]))
-    return {"job_id": job_id, "runs": result, "diagnostics": sorted(errors),
-            "scope_notes": MEMORY_SCOPE_NOTES}
+    return with_runtime({"job_id": job_id, "runs": result, "diagnostics": sorted(errors),
+                         "scope_notes": MEMORY_SCOPE_NOTES})
+
+
+def with_runtime(data):
+    """Attach elapsed time through each run's latest saved sample, never wall-clock now."""
+    report = dict(data, scheduler=data.get("scheduler") or {"queue": []},
+                  scheduler_snapshot_at=data.get("scheduler_snapshot_at"))
+    snapshot = timestamp_seconds(report["scheduler_snapshot_at"])
+    if snapshot is not None:
+        # Runs created after this snapshot must not displace its allocation.
+        report["runs"] = [run for run in data["runs"]
+                          if (timestamp_seconds(run["metadata"].get("created_at")) or 0) <= snapshot + 60]
+    runs = []
+    for run in data["runs"]:
+        source, start = run_start(report, run)
+        created = timestamp_seconds(run["metadata"].get("created_at"))
+        # A requeue first seen after the initial snapshot cannot inherit its start.
+        if source == "slurm" and created > snapshot + 60:
+            source, start = "monitoring", created
+        bounds = [(node["points"][0]["time"], node["points"][-1]["time"])
+                  for node in run["nodes"] if node["points"]]
+        first = min((first for first, _ in bounds), default=None)
+        last = max((last for _, last in bounds), default=None)
+        if start is None and first is not None:
+            source, start = "samples", first / 1000
+        seconds = (last / 1000 - start) if last is not None and start is not None else None
+        if seconds is not None:
+            seconds = max(0, seconds) if math.isfinite(seconds) and seconds >= -60 else None
+        runs.append(dict(run, runtime={"source": source, "seconds": seconds,
+                                      "display": display_elapsed(seconds), "sampled_at": last}))
+    return dict(data, runs=runs)
 
 
 HTML = """<!doctype html>
@@ -162,7 +194,7 @@ HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline';
 style-src 'unsafe-inline'; connect-src 'self'; img-src data: blob:">
-<title>jobmon history</title>
+<title>Job history</title>
 <style>
 :root{color-scheme:dark;--bg:#292d3e;--bg-dark:#1d202f;--bg-high:#363d5c;--line:#343a55;
 --fg:#c0caf5;--fg-dim:#a9b1d6;--muted:#737aa2;--edge:#414868;--focus:#2e3c64;
@@ -171,17 +203,28 @@ style-src 'unsafe-inline'; connect-src 'self'; img-src data: blob:">
 color:var(--fg);background:var(--bg);margin:0}
 ::selection{background:#3d59a1}header{display:flex;align-items:center;gap:18px;padding:12px 18px;
 background:var(--bg-dark);border-bottom:1px solid var(--edge);box-shadow:inset 0 2px #29a4bd}
-header h1{font-size:14px;color:var(--blue);margin:0;white-space:nowrap}#title{overflow-wrap:anywhere}
+header h1{font-size:14px;color:var(--blue);margin:0}#title{overflow-wrap:anywhere;min-width:0}
+#runtime{font-size:12px;color:var(--cyan);white-space:nowrap;font-variant-numeric:tabular-nums}
 #connection{margin-left:auto;color:var(--muted);font-size:12px}#connection.live{color:var(--green)}
+#job-tabs{display:flex;gap:6px;padding:8px 18px;background:var(--bg-dark);
+border-bottom:1px solid var(--line);overflow-x:auto}#job-tabs[hidden]{display:none}
+#job-tabs button{white-space:nowrap;flex-shrink:0;max-width:320px;overflow:hidden;text-overflow:ellipsis}
+#job-tabs button[aria-selected="true"]{background:var(--focus);border-color:var(--blue);color:var(--blue)}
+#job-tabs button::before{content:"";display:inline-block;width:6px;height:6px;margin-right:8px;
+border-radius:50%;background:var(--muted)}#job-tabs button.live::before{background:var(--green)}
+#job-tabs button.warning::before{background:var(--orange)}
 main{display:grid;grid-template-columns:260px minmax(0,1fr);min-height:calc(100vh - 45px)}
+main.sidebar-collapsed{grid-template-columns:minmax(0,1fr)}
 aside{padding:18px;background:var(--bg-dark);border-right:1px solid var(--line);overflow-wrap:anywhere}
 aside h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--magenta);margin:0 0 18px}
-.charts{max-width:1500px;padding:20px;min-width:0}p{line-height:1.6}.controls{display:grid;gap:16px}
+.charts{padding:20px;min-width:0}p{line-height:1.6}.controls{display:grid;gap:16px}
 label{display:grid;gap:6px;color:var(--fg-dim);font-size:12px}
 select,button{font:inherit;padding:6px 8px;border:1px solid var(--edge);border-radius:5px;
 background:var(--bg-high);color:var(--fg-dim);min-width:0;max-width:100%}
 button{cursor:pointer}button:hover{color:var(--fg);border-color:var(--blue)}
 button:focus-visible,select:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+#sidebar-toggle{display:grid;place-items:center;padding:6px;flex-shrink:0}
+#sidebar-toggle svg{width:18px;height:18px}
 section{background:var(--bg-dark);border:1px solid var(--line);border-radius:5px;padding:16px;margin-bottom:18px}
 h2{font-size:13px;color:var(--blue);margin:0 0 12px;font-weight:600}
 svg{width:100%;height:auto;display:block;touch-action:pan-y}
@@ -194,9 +237,15 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 ui-monospace,monos
 main{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}
 .controls{grid-template-columns:repeat(3,minmax(0,1fr))}.charts{padding:12px}header{gap:12px;flex-wrap:wrap}}
 </style>
-<header><h1>hpc-live</h1><span id="title">Job history</span>
+<header><button id="sidebar-toggle" type="button" aria-controls="sidebar" aria-expanded="true"
+aria-label="Toggle sidebar" title="Toggle sidebar">
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+aria-hidden="true" focusable="false"><rect x="3" y="3" width="18" height="18" rx="2"/>
+<path d="M9 3v18"/></svg></button>
+<h1 id="title">Job history</h1><span id="runtime">Elapsed unavailable</span>
 <span id="connection" role="status" aria-live="polite">Connecting</span></header>
-<main><aside><h2>Saved history</h2>
+<div id="job-tabs" role="tablist" aria-label="Jobs" hidden></div><div id="job-panel">
+<main><aside id="sidebar"><h2>Saved history</h2>
 <div class="controls">
 <label>Run<select id="run"></select></label>
 <label>Node<select id="node"></select></label>
@@ -220,11 +269,13 @@ main{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(
 CPU averages cover sampled intervals only.
 Memory peaks are sampled per node; independent node peaks are never a concurrent total.
 Wrapper exit codes do not establish final Slurm state. All assets stay local.</small></p>
-</div></main>
+</div></main></div>
 <script type="application/json" id="data">__JOBMON_DATA__</script>
 <script>
 "use strict";
 let data=JSON.parse(document.getElementById("data").textContent);
+let jobs=[], selectedJob=null;
+const jobViews=new Map();
 const byId=id=>document.getElementById(id), ns="http://www.w3.org/2000/svg";
 const series={
  cpu:[["cpu","Last interval","#7aa2f7"],["average","Average","#ff9e64"],["maximum","Maximum","#9ece6a"]],
@@ -258,16 +309,24 @@ function chart(id,points){
  const range=Math.max(1000,last-first);
  let maximum=id==="cpu"?100:0;
  for(const point of points)for(const [key] of specs)if(point[key]!==null)maximum=Math.max(maximum,point[key]);
- maximum=maximum>0?maximum*1.1:1;
+ maximum=id==="cpu" && maximum===100?100:maximum>0?maximum*1.1:1;
  const x=time=>left+(time-first)/range*(right-left), y=value=>bottom-value/maximum*(bottom-top);
  for(let tick=0;tick<=4;tick++){
   const value=maximum*tick/4, py=y(value), px=left+(right-left)*tick/4;
   svg.appendChild(element("line",{x1:left,x2:right,y1:py,y2:py,stroke:"#343a55"}));
-  svg.appendChild(element("text",{x:left-10,y:py+4,"text-anchor":"end"},Number(value.toPrecision(3))));
+  const label=Number(value.toPrecision(3))+(id==="cpu"?"%":"");
+  svg.appendChild(element("text",{x:left-10,y:py+4,"text-anchor":"end"},label));
   const stamp=first+(last-first)*tick/4;
   let text=labelTime(stamp,first);
   if(byId("axis").value==="clock" && last-first<86400000)text=new Date(stamp).toLocaleTimeString();
   svg.appendChild(element("text",{x:px,y:bottom+28,"text-anchor":tick===0?"start":tick===4?"end":"middle"},text));
+ }
+ if(id==="cpu"){
+  const py=y(100);
+  svg.appendChild(element("line",{x1:left,x2:right,y1:py,y2:py,stroke:"#737aa2",
+   "stroke-dasharray":"5 4","data-reference":"100-percent"}));
+  if(maximum>100)svg.appendChild(element("text",{x:right-6,y:Math.max(top+14,py-6),
+   "text-anchor":"end"},"100%"));
  }
  for(const [key,,color] of specs){
   let path="",pen=false;
@@ -301,7 +360,15 @@ function chart(id,points){
 }
 function draw(){
  const run=data.runs[Number(byId("run").value)], node=run?.nodes[Number(byId("node").value)];
- byId("title").textContent="Job "+data.job_id+(run?.job_name?" ("+run.job_name+")":"");
+ const name=run?.job_name||jobName(data);
+ byId("title").textContent="Job "+data.job_id+(name?" ("+name+")":"");
+ const runtime=run?.runtime, labels={slurm:"Elapsed",monitoring:"Monitored",samples:"Sample span"};
+ byId("runtime").textContent=runtime?.seconds!=null?labels[runtime.source]+" "+runtime.display:"Elapsed unavailable";
+ const origins={slurm:"Job start inferred from the initial Slurm snapshot",
+  monitoring:"Monitoring start; full job elapsed time unavailable",
+  samples:"First saved sample; full job elapsed time unavailable"};
+ byId("runtime").title=runtime?.seconds!=null?origins[runtime.source]+"; through latest saved sample at "+
+  new Date(runtime.sampled_at).toLocaleString():"Waiting for a saved sample with a usable start time.";
  const connection=byId("connection");
  connection.textContent=data.live?(data.connection||"Connecting"):"Saved snapshot";
  connection.className=data.live && data.connection==="Live"?"live":"";
@@ -317,10 +384,10 @@ function draw(){
  byId("scheduler").textContent=queue?"Slurm snapshot: "+queue.state+
   (snapshot?" at "+new Date(snapshot).toLocaleTimeString():"")+" · not refreshed while viewing":"";
  byId("diagnostics").textContent=data.diagnostics.join("\\n")||"No recorded diagnostics.";
- if(data.live)byId("notice").textContent="Live saved samples over one SSH connection. Hover or tap for values. "+
+ if(data.live)byId("notice").textContent="Live saved samples. Hover or tap for values. "+
   "CPU averages cover sampled intervals only. Missing readings remain gaps. Memory peaks stay per node. "+
-  "Closing the last tab stops viewing, while workload collection continues.";
- document.title="hpc-live · "+byId("title").textContent;
+  "Closing the last browser tab stops viewing, while workload collection continues.";
+ document.title=byId("title").textContent;
  for(const id of Object.keys(series)){
   chart(id,node?node.points:[]);byId(id+"-reading").textContent="Hover or tap to inspect.";
   document.querySelector('[data-save="'+id+'"]').disabled=!node?.points.length;
@@ -334,17 +401,83 @@ function selectRun(preferredNode){
  if(selected>=0)byId("node").value=selected;
  draw();
 }
-function update(next){
- const old=data.runs[Number(byId("run").value)];
- const selected=old?.nodes[Number(byId("node").value)]?.node;
- const following=!old || old===data.runs[data.runs.length-1];
- data=next;byId("run").replaceChildren();
+function jobName(job){
+ return job.scheduler?.queue?.[0]?.job_name||[...job.runs].reverse().find(run=>run.job_name)?.job_name||"";
+}
+function rememberJob(){
+ if(!jobs.length || !data.job_id)return;
+ const run=data.runs[Number(byId("run").value)];
+ jobViews.set(data.job_id,{run:run?.run_id,node:run?.nodes[Number(byId("node").value)]?.node,
+  following:!run || run===data.runs[data.runs.length-1],axis:byId("axis").value,
+  exportStatus:byId("export-status").textContent});
+}
+function showJob(){
+ data=jobs.find(job=>job.job_id===selectedJob);
+ const view=jobViews.get(selectedJob);
+ byId("run").replaceChildren();
  data.runs.forEach((run,index)=>option(byId("run"),index,run.run_id));
- let index=following?data.runs.length-1:data.runs.findIndex(run=>run.run_id===old?.run_id);
+ let index=view && !view.following?data.runs.findIndex(run=>run.run_id===view.run):data.runs.length-1;
  if(index<0)index=data.runs.length-1;
- byId("run").value=index;selectRun(selected);
+ byId("run").value=index;byId("axis").value=view?.axis||"clock";
+ byId("export-status").textContent=view?.exportStatus||"";
+ selectRun(view?.node);
+}
+function selectJob(jobId){
+ if(selectedJob===jobId)return;
+ rememberJob();selectedJob=jobId;renderJobTabs();showJob();
+}
+function renderJobTabs(){
+ const tabs=byId("job-tabs"), panel=byId("job-panel");
+ tabs.hidden=jobs.length<2;
+ if(jobs.length>1){
+  panel.setAttribute("role","tabpanel");panel.setAttribute("aria-labelledby","job-tab-"+selectedJob);
+ }else{panel.removeAttribute("role");panel.removeAttribute("aria-labelledby");}
+ for(const button of Array.from(tabs.children))
+  if(!jobs.some(job=>job.job_id===button.dataset.jobId))button.remove();
+ for(const job of jobs){
+  const id="job-tab-"+job.job_id;
+  let button=byId(id);
+  if(!button){
+   button=document.createElement("button");button.id=id;button.type="button";button.dataset.jobId=job.job_id;
+   button.setAttribute("role","tab");button.setAttribute("aria-controls","job-panel");
+   button.onclick=()=>selectJob(job.job_id);
+   button.onkeydown=event=>{
+    const index=jobs.findIndex(item=>item.job_id===job.job_id);
+    const moves={ArrowRight:(index+1)%jobs.length,ArrowLeft:(index+jobs.length-1)%jobs.length,
+                 Home:0,End:jobs.length-1};
+    if(!Object.hasOwn(moves,event.key))return;
+    event.preventDefault();selectJob(jobs[moves[event.key]].job_id);
+    byId("job-tab-"+selectedJob).focus();
+   };
+   tabs.appendChild(button);
+  }
+  const name=jobName(job), selected=job.job_id===selectedJob;
+  button.textContent=job.job_id+(name?" ("+name+")":"");
+  button.title=button.textContent+" · "+(job.connection||"Saved snapshot");
+  button.setAttribute("aria-selected",String(selected));button.tabIndex=selected?0:-1;
+  button.className=job.connection==="Live"?"live":job.connection==="Connecting"?"":"warning";
+ }
+}
+function update(next){
+ const previous=data;
+ rememberJob();jobs=next.jobs||[next];
+ if(!jobs.some(job=>job.job_id===selectedJob))selectedJob=jobs[0].job_id;
+ renderJobTabs();
+ const selected=jobs.find(job=>job.job_id===selectedJob);
+ // Background jobs can update without disturbing the selected chart or hover.
+ if(previous.job_id===selectedJob && selected.version!==undefined && previous.version===selected.version &&
+    previous.connection===selected.connection)return;
+ showJob();
 }
 byId("run").onchange=()=>selectRun();byId("node").onchange=draw;byId("axis").onchange=draw;
+function toggleSidebar(){
+ const sidebar=byId("sidebar"), expanded=sidebar.hidden;
+ sidebar.hidden=!expanded;
+ sidebar.parentElement.classList.toggle("sidebar-collapsed",!expanded);
+ const button=byId("sidebar-toggle");
+ button.setAttribute("aria-expanded",String(expanded));
+}
+byId("sidebar-toggle").onclick=toggleSidebar;
 for(const [id,specs] of Object.entries(series))for(const [,label,color] of specs){
  const item=document.createElement("span");item.textContent=label;item.style.setProperty("--color",color);
  byId(id+"-legend").appendChild(item);

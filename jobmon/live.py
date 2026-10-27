@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Local browser dashboard for the saved-sample JSON-over-SSH stream."""
+"""Local browser dashboard for per-job saved-sample JSON-over-SSH streams."""
 
 import argparse
 import bisect
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -19,7 +20,7 @@ import webbrowser
 
 from collect import SCHEMA_VERSION, checked_name
 from jobmon import MAX_LINE, MEMORY_SCOPE_NOTES
-from plot import metadata_for_plot, render_html
+from plot import metadata_for_plot, render_html, with_runtime
 from slurm_backend import JobmonError, validate_job_id
 
 # As in _jobmon_ssh: user arguments travel only in JSON on stdin.
@@ -31,10 +32,11 @@ MAX_EVENT_LINE = 4 * MAX_LINE
 
 
 class LiveState:
-    def __init__(self, job_id, interval=5):
+    def __init__(self, job_id, interval=5, group=None):
         self.job_id = validate_job_id(job_id)
         self.interval = interval
-        self.changed = threading.Condition()
+        self.group = group
+        self.changed = group.changed if group is not None else threading.Condition()
         self.version = 0
         self.runs = {}
         self.errors = deque(maxlen=100)
@@ -85,8 +87,13 @@ class LiveState:
             else:
                 raise JobmonError("Unknown live stream event.")
             self.last_received = time.monotonic()
-            self.version += 1
-            self.changed.notify_all()
+            self._notify()
+
+    def _notify(self):
+        self.version += 1
+        if self.group is not None:
+            self.group.version += 1
+        self.changed.notify_all()
 
     def _sample(self, event):
         run = self.runs.get(event.get("run_id"))
@@ -145,8 +152,7 @@ class LiveState:
         with self.changed:
             self.connection = message
             self._error(message)
-            self.version += 1
-            self.changed.notify_all()
+            self._notify()
 
     def snapshot(self):
         with self.changed:
@@ -155,10 +161,26 @@ class LiveState:
                 connection = "Waiting for remote stream"
             runs = [dict(run, nodes=[run["nodes"][node] for node in sorted(run["nodes"])])
                     for _, run in sorted(self.runs.items())]
-            return copy.deepcopy({"job_id": self.job_id, "runs": runs, "scope_notes": MEMORY_SCOPE_NOTES,
+            return copy.deepcopy(with_runtime({"job_id": self.job_id, "runs": runs, "scope_notes": MEMORY_SCOPE_NOTES,
                 "diagnostics": list(self.errors), "live": True, "connection": connection,
                 "updated_at": self.updated_at, "scheduler": self.scheduler,
-                "scheduler_snapshot_at": self.scheduler_snapshot_at})
+                "scheduler_snapshot_at": self.scheduler_snapshot_at}))
+
+
+class MultiJobState:
+    def __init__(self, job_ids, interval=5):
+        ids = [validate_job_id(job_id) for job_id in job_ids]
+        if not ids or len(ids) != len(set(ids)):
+            raise JobmonError("Choose at least one job; duplicate job IDs are not allowed.")
+        self.changed = threading.Condition()
+        self.version = 0
+        self.jobs = [LiveState(job_id, interval, group=self) for job_id in ids]
+
+    def snapshot(self):
+        with self.changed:
+            if len(self.jobs) == 1:
+                return self.jobs[0].snapshot()
+            return {"live": True, "jobs": [dict(job.snapshot(), version=job.version) for job in self.jobs]}
 
 
 class SSHSource:
@@ -227,7 +249,10 @@ class SSHSource:
             if self.thread is not None:
                 self.thread.join(timeout=3)
             for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
-                stream.close()
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -346,22 +371,28 @@ def open_browser(url):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("job_id")
+    parser.add_argument("job_id", nargs="+", metavar="JOB_ID")
     parser.add_argument("--host", required=True)
     parser.add_argument("--interval", type=int, default=5, help="remote saved-file refresh seconds")
     parser.add_argument("--port", type=int, default=0, help="local port; 0 chooses a free port")
     parser.add_argument("--no-browser", action="store_true", help="print the URL without opening it")
     args = parser.parse_args(argv)
-    source = server = None
+    sources, server = [], None
     try:
         if not 1 <= args.interval <= 86400 or not 0 <= args.port <= 65535:
             raise JobmonError("Interval must be 1–86400 seconds and port must be 0–65535.")
-        state = LiveState(args.job_id, args.interval)
-        source = SSHSource(state, args.host)
+        state = MultiJobState(args.job_id, args.interval)
+        sources = [SSHSource(job, args.host) for job in state.jobs]
         server = DashboardServer(state, args.port)
-        source.start()
+        for source in sources:
+            try:
+                source.start()
+            except OSError as exc:
+                if len(sources) == 1:
+                    raise
+                source.state.disconnected("Could not start remote stream: " + str(exc))
         print("hpc-live: " + server.url, flush=True)
-        print("Close the last dashboard tab or press Ctrl-C to stop viewing.", flush=True)
+        print("Close the last dashboard browser tab or press Ctrl-C to stop viewing.", flush=True)
         if not args.no_browser:
             threading.Thread(target=open_browser, args=(server.url,), daemon=True).start()
         server.serve_forever(poll_interval=0.1)
@@ -375,8 +406,9 @@ def main(argv=None):
         if server is not None:
             server.stopping.set()
             server.server_close()
-        if source is not None:
-            source.close()
+        if sources:
+            with ThreadPoolExecutor(max_workers=min(32, len(sources))) as closing:
+                list(closing.map(lambda source: source.close(), sources))
 
 
 if __name__ == "__main__":
