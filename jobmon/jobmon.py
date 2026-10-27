@@ -7,6 +7,7 @@ from contextlib import ExitStack
 import datetime as dt
 import heapq
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -40,9 +41,10 @@ def timestamp_seconds(value):
 class RunHistory:
     """Incremental JSONL reader and streaming aggregates, bounded by nodes/devices."""
 
-    def __init__(self, directory, metadata):
+    def __init__(self, directory, metadata, on_sample=None):
         self.directory = directory
         self.metadata = metadata
+        self.on_sample = on_sample
         self.cursors = {}
         self.nodes = {}
         self.gpus = {}
@@ -181,6 +183,8 @@ class RunHistory:
         for error in record.get("errors", []):
             if len(self.errors) < 100:
                 self.errors.add(str(error))
+        if self.on_sample is not None:
+            self.on_sample(self, record)
 
     def record_memory(self, node, when, current, interval, stream_name):
         expected = self.metadata["expected_nodes"]
@@ -377,12 +381,13 @@ class RunHistory:
 
 
 class SavedHistory:
-    def __init__(self, job_id, root=None):
+    def __init__(self, job_id, root=None, on_sample=None):
         self.job_id = validate_job_id(job_id)
         self.root = Path(root or data_root())
         self.runs = {}
         self.errors = []
         self.ignored = []
+        self.on_sample = on_sample
 
     def refresh(self):
         if not self.root.exists():
@@ -405,7 +410,7 @@ class SavedHistory:
                 continue
             try:
                 metadata = load_run(path, self.root, self.job_id)
-                self.runs[path.name] = RunHistory(path, metadata)
+                self.runs[path.name] = RunHistory(path, metadata, self.on_sample)
             except (OSError, JobmonError, ValueError, TypeError) as exc:
                 message = str(exc)
                 if message not in self.errors:
@@ -413,11 +418,11 @@ class SavedHistory:
         return [run.summary() for run in self.runs.values()]
 
 
-def build_report(job_id, days=30, live=False, backend=None):
+def build_report(job_id, days=30, live=False, backend=None, on_sample=None):
     scheduler = (backend or SlurmBackend()).snapshot(job_id, days, live)
     canonical = {r["job_id"] for r in scheduler["accounting"]}
     stored_id = next(iter(canonical)) if len(canonical) == 1 else job_id
-    history = SavedHistory(stored_id)
+    history = SavedHistory(stored_id, on_sample=on_sample) if on_sample is not None else SavedHistory(stored_id)
     runs = history.refresh()
     if not scheduler["ownership_verified"] and not runs:
         diagnostics = scheduler["errors"] + history.errors
@@ -484,6 +489,73 @@ def average_cpu(state):
 METRIC_LABELS = {"cpu_percent_covered_intervals": "CPU percentage",
                  "concurrent_memory_peak_bytes": "concurrent memory peak",
                  "cgroup_memory_peak_bytes": "kernel memory peak", "gpus": "GPU"}
+
+
+def sample_point(history, record):
+    """One validated reading, using the same covered-interval values as watch."""
+    state = history.nodes[record["node"]]
+    metrics = record["metrics"]
+    delta, duration = number(metrics.get("cpu_delta_seconds")), number(metrics.get("cpu_interval_seconds"))
+    cpus, interval = number(metrics.get("allocated_cpus")), number(record["interval_seconds"])
+    valid_cpu = delta is not None and duration and duration <= interval * 1.5 and cpus
+    memory = number(metrics.get("memory_bytes")) if metrics["scope"] in MEMORY_SCOPE_NOTES else None
+    point = {"time": timestamp_seconds(record["timestamp"]) * 1000,
+             "cpu": 100 * delta / (duration * cpus) if valid_cpu else None, "average": average_cpu(state)[0],
+             "maximum": state["max_interval_cpu_percent"], "memory": memory,
+             "memory_peak": state["memory_peak_bytes"], "final": bool(record.get("final")),
+             "stream_id": record["stream_id"], "interval": interval,
+             "scope": metrics["scope"], "samples": state["samples"]}
+    for key in ("cpu", "average", "maximum", "memory", "memory_peak"):
+        if point[key] is not None and not math.isfinite(point[key]):
+            point[key] = None
+        if key.startswith("memory") and point[key] is not None:
+            point[key] /= 1024 ** 3
+    return point
+
+
+def stream_history(job_id, interval=5, count=None, days=30):
+    """Stream all initial samples, then only validated appended records."""
+    known = set()
+    written = 0
+
+    def send(event):
+        nonlocal written
+        print(json.dumps(dict(event, schema_version=SCHEMA_VERSION, job_id=job_id),
+                         separators=(",", ":"), allow_nan=False))
+        written += 1
+        if written % 256 == 0:
+            sys.stdout.flush()
+
+    def sample(history, record):
+        run_id = history.metadata["run_id"]
+        if run_id not in known:
+            send({"event": "run", "metadata": history.metadata})
+            known.add(run_id)
+        send({"event": "sample", "run_id": run_id, "node": record["node"],
+              "point": sample_point(history, record),
+              "raw_sample": json.dumps(record, separators=(",", ":"))})
+
+    report, history = build_report(job_id, days, on_sample=sample)
+    displayed = 0
+    while True:
+        for run in report["runs"]:
+            if run["run_id"] not in known:
+                send({"event": "run", "metadata": run["metadata"]})
+                known.add(run["run_id"])
+        send({"event": "status", "generated_at": report["generated_at"],
+              "scheduler_snapshot_at": report["scheduler_snapshot_at"],
+              "scheduler": report["scheduler"] if displayed == 0 else None,
+              "history_reason": report["history_reason"] if not report["runs"] else None,
+              "runs": [{"run_id": run["run_id"], "completion": run["completion"],
+                        "errors": run["errors"]} for run in report["runs"]],
+              "errors": report["errors"]})
+        sys.stdout.flush()
+        displayed += 1
+        if count is not None and displayed >= count:
+            return
+        time.sleep(interval)
+        report["generated_at"] = utc_now()
+        report["runs"] = history.refresh()
 
 
 def multi_node(run):
@@ -936,6 +1008,9 @@ def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=
     if operation == "fetch":
         export_history(job_id)
         return
+    if operation == "live":
+        stream_history(job_id, interval, count, days)
+        return
     report, history = build_report(job_id, days, live=operation == "show")
     if operation != "watch":
         emit(report, as_json)
@@ -989,13 +1064,14 @@ def transport_request(stream):
                   "exit_on_completion"},
         "report": {"operation", "job_id", "json", "days"},
         "fetch": {"operation", "job_id"},
+        "live": {"operation", "job_id", "interval", "count", "days"},
     }
     if operation not in allowed:
         raise JobmonError("Unsupported transport operation.")
     unsupported = set(request) - allowed[operation]
     if unsupported:
         raise JobmonError("Unsupported fields for {}: {}.".format(operation, ", ".join(sorted(unsupported))))
-    if operation in ("show", "watch", "report", "fetch"):
+    if operation in ("show", "watch", "report", "fetch", "live"):
         validate_job_id(request.get("job_id"))
     for name in ("json", "exit_on_completion"):
         if name in request and not isinstance(request[name], bool):
@@ -1012,15 +1088,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="operation", required=True)
     subs.add_parser("_transport", help="private JSON-over-SSH entry point")
-    for name in ("doctor", "storage-init", "jobs", "show", "watch", "report"):
+    for name in ("doctor", "storage-init", "jobs", "show", "watch", "report", "live"):
         command = subs.add_parser(name)
         command.add_argument("--json", dest="as_json", action="store_true")
-        if name in ("show", "watch", "report"):
+        if name in ("show", "watch", "report", "live"):
             command.add_argument("job_id")
             command.add_argument("--days", type=int, default=30)
-        if name == "watch":
+        if name in ("watch", "live"):
             command.add_argument("--interval", type=int, default=5)
             command.add_argument("--count", type=int, help="stop after this many snapshots")
+        if name == "watch":
             command.add_argument("--exit-on-completion", action="store_true",
                                  help="stop after the newest saved run has a workload exit and all final samples")
     args = vars(parser.parse_args(argv))

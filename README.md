@@ -1,7 +1,7 @@
 # jobmon
 
 Personal Slurm monitoring with Python 3.8+ and the standard library:
-`squeue`/`sacct` reports and optional allocation-local CPU, memory, and GPU samples.
+`squeue`/`sacct` reports, optional CPU/memory/GPU samples, and live browser charts.
 No administrator access or package installation required.
 
 An independent, minimal version of Princeton University's

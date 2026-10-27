@@ -18,8 +18,12 @@ configuration, limitations, and daily usage.
   and scheduler output parsing/normalization.
 - `jobmon/collect.py`: allocation-local cgroup/GPU sampling and private history
   storage. It does not poll the scheduler.
+- `jobmon/plot.py`: workstation-only archive reader and standalone HTML/SVG time
+  plots; reuses report validation and CPU calculations, never extracts archives.
+- `jobmon/live.py`: loopback browser dashboard and single SSH sample-stream client;
+  uses the plot renderer and shuts down after the last browser tab closes.
 - `shell/jobmon.zsh`: workstation commands such as `hpc-jobs`, `hpc-jreport`,
-  `hpc-jfetch`, and `hpc-jdeploy`.
+  `hpc-jfetch`, `hpc-live`, and `hpc-jdeploy`.
 - `shell/deploy-jobmon.sh`: explicit, checksum-verified, content-addressed remote
   deployment of the three Python source files and `examples/monitored-job.sh`,
   with a stable wrapper symlink under `~/.local/bin`. `--local` runs the identical

@@ -10,9 +10,12 @@ __pycache__/
 *.key
 *.pem
 
-# hpc-jfetch output contains private job history.
+# Fetched history and browser exports contain private job data.
 /downloads/
 jobmon-*.tar.gz
+jobmon-*.html
+jobmon-*.svg
+jobmon-*.zip
 *.partial
 
 # Generated documentation can retain text removed from its Markdown source.

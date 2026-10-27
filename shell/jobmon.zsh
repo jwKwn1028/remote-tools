@@ -3,7 +3,7 @@
 # A dotfile manager may provide it, but this public source must not hard-code it.
 
 # Record this bundle's location while it is being sourced, so hpc-jdeploy finds
-# the installer from any clone. :A also resolves a symlinked dotfile module.
+# the installer and local plotter from any clone. :A resolves symlinked modules.
 () {
   emulate -L zsh
   typeset -g _jobmon_bundle_dir=${${(%):-%x}:A:h:h}
@@ -96,6 +96,7 @@ _jobmon_request() {
 # Keys are read from and the menu drawn on /dev/tty, so piped output stays clean.
 _jobmon_choose_job() {
   emulate -L zsh
+  local action=${1:-watch}
   local job_pattern='^[1-9][0-9]*(_[0-9]+)?$' output line key rest frame terminal=
   local -a fields ids rows
   local -i others=0 count selected=1 top=1 visible drawn=0 i width
@@ -119,9 +120,9 @@ _jobmon_choose_job() {
   count=${#ids}
   if (( count == 0 )); then
     if (( others )); then
-      print -u2 -- "jobmon: no running jobs to watch ($others queued or not running)."
+      print -u2 -- "jobmon: no running jobs to $action ($others queued or not running)."
     else
-      print -u2 -- 'jobmon: no running jobs to watch.'
+      print -u2 -- "jobmon: no running jobs to $action."
     fi
     return 1
   fi
@@ -144,7 +145,7 @@ _jobmon_choose_job() {
       (( selected >= top + visible )) && top=$(( selected - visible + 1 ))
       frame=$'\r'
       (( drawn > 1 )) && frame+=$'\e['$(( drawn - 1 ))'A'
-      frame+=$'\e[J'"Choose a running job to watch ($selected/$count"
+      frame+=$'\e[J'"Choose a running job to $action ($selected/$count"
       (( others )) && frame+="; $others queued or not running"
       frame+=$')\n'"  ${$(printf '%-16s %-20.20s %-11s %11s %5s %5s  %s' 'JOB ID' NAME STATE ELAPSED CPUS NODES NODELIST)[1,width]}"$'\n'
       for (( i = top; i < top + visible; i++ )); do
@@ -154,7 +155,7 @@ _jobmon_choose_job() {
           frame+="  ${rows[i][1,width]}"$'\n'
         fi
       done
-      frame+='j/k or arrows: move   Enter: watch   q or Esc: cancel'
+      frame+="j/k or arrows: move   Enter: $action   q or Esc: cancel"
       print -rn -- "$frame" >/dev/tty
       drawn=$(( visible + 3 ))
       read -sk 1 key || return 130
@@ -199,6 +200,60 @@ hpc-jwatch() {
   _jobmon_request watch "$@"
 }
 hpc-jreport() { emulate -L zsh; _jobmon_request report "$@"; }
+
+hpc-live() {
+  emulate -L zsh
+  local job_id='' interval=5 port=0 host REPLY option value
+  local tools_dir=${HPC_JOBMON_TOOLS_DIR:-${_jobmon_bundle_dir:-}}
+  local -a options
+  while (( $# )); do
+    case $1 in
+      -h|--help)
+        print -r -- 'Usage: hpc-live [JOB_ID] [--interval SECONDS] [--port PORT] [--no-browser]'
+        print -r -- 'Without an ID, choose a running job. Opens a local browser dashboard of live saved samples.'
+        return 0
+        ;;
+      --interval|--port)
+        option=$1
+        value=${2:-}
+        local integer_pattern='^(0|[1-9][0-9]{0,5})$'
+        if [[ ! $value =~ $integer_pattern ]] ||
+           [[ $option == --interval && ( $value -lt 1 || $value -gt 86400 ) ]] ||
+           [[ $option == --port && $value -gt 65535 ]]; then
+          print -u2 -- "jobmon: invalid value for $option."
+          return 2
+        fi
+        if [[ $option == --interval ]]; then interval=$value; else port=$value; fi
+        shift 2
+        ;;
+      --no-browser) options+=(--no-browser); shift ;;
+      *)
+        local job_pattern='^[1-9][0-9]*(_[0-9]+)?$'
+        if [[ -n $job_id || ! $1 =~ $job_pattern || ${#1} -gt 40 ]]; then
+          print -u2 -- 'Usage: hpc-live [JOB_ID] [--interval SECONDS] [--port PORT] [--no-browser]'
+          return 2
+        fi
+        job_id=$1
+        shift
+        ;;
+    esac
+  done
+  if [[ ! -r $tools_dir/jobmon/live.py ]]; then
+    print -u2 -- 'jobmon: cannot find jobmon/live.py; source helpers from the clone or set HPC_JOBMON_TOOLS_DIR.'
+    return 2
+  fi
+  if ! command -v python3 >/dev/null; then
+    print -u2 -- 'jobmon: hpc-live needs an existing local Python 3.8+ interpreter named python3.'
+    return 2
+  fi
+  if [[ -z $job_id ]]; then
+    _jobmon_choose_job view || return
+    job_id=$REPLY
+  fi
+  _jobmon_host || return
+  host=$REPLY
+  command python3 "$tools_dir/jobmon/live.py" "$job_id" --host "$host" --interval "$interval" --port "$port" "${options[@]}"
+}
 
 hpc-jdeploy() {
   emulate -L zsh

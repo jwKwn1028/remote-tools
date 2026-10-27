@@ -1533,8 +1533,8 @@ class TransportTests(unittest.TestCase):
             "{}\t{}\t1:00\t4\t1\tnode1\t{}\n".format(row[0], row[1], row[2] if len(row) > 2 else "job-" + row[0])
             for row in rows)
 
-    def pick(self, table, keys=(), args=(), lines=24):
-        """Run hpc-jwatch in a pseudo-terminal; return (screen output, exit status, requests)."""
+    def pick(self, table, keys=(), args=(), lines=24, command="hpc-jwatch"):
+        """Run a job picker in a pseudo-terminal; return (screen output, exit status, requests)."""
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             capture = base / "requests.jsonl"
@@ -1549,11 +1549,16 @@ class TransportTests(unittest.TestCase):
             env.update(PATH=str(base) + os.pathsep + os.environ["PATH"], SSH_CAPTURE=str(capture), TZ="UTC",
                        JOBS_TABLE=table, HPC_JOBMON_HOST="test-alias", TERM="xterm", COLUMNS="100",
                        LINES=str(lines))
+            if command == "hpc-live":
+                plotter = base / "tools/jobmon/live.py"
+                plotter.parent.mkdir(parents=True)
+                plotter.write_text("import sys\nprint('viewed ' + sys.argv[1])\n")
+                env["HPC_JOBMON_TOOLS_DIR"] = str(plotter.parent.parent)
             pid, fd = pty.fork()
             if pid == 0:
                 try:
                     # Report terminal settings afterwards: the menu must restore signal keys and echo.
-                    script = ('source "$1"; shift; hpc-jwatch "$@"; rc=$?; '
+                    script = ('source "$1"; shift; ' + command + ' "$@"; rc=$?; '
                               'print -r -- "terminal:" $(stty -a </dev/tty | tr " " "\\n" '
                               '| grep -xE -- "-?(isig|echo)"); exit $rc')
                     os.execvpe("zsh", ["zsh", "-f", "-c", script, "test", str(ROOT / "shell/jobmon.zsh"), *args], env)
@@ -1600,6 +1605,38 @@ class TransportTests(unittest.TestCase):
         self.assertIn("Cannot start test shell zsh: synthetic missing shell", screen)
         self.assertNotIn("Traceback", screen)
         self.assertEqual(requests, [])
+
+    def test_live_picker_uses_keys_and_passes_the_selected_id(self):
+        table = self.job_table(("900_2", "PENDING"), ("900_0", "RUNNING", "first simulation"),
+                               ("900_1", "RUNNING", "second simulation"))
+        for keys, chosen in (([b"j", b"k", b"j", b"\n"], "900_1"),
+                             ([b"\x1b[B", b"\x1b[A", b"\r"], "900_0")):
+            with self.subTest(keys=keys):
+                screen, status, requests = self.pick(table, keys, command="hpc-live")
+                self.assertEqual(status, 0, screen)
+                self.assertIn("Choose a running job to view", screen)
+                self.assertIn("Enter: view", screen)
+                self.assertIn("second simulation", screen)
+                self.assertIn("viewed " + chosen, screen)
+                self.assertIn("terminal: isig echo", screen)
+                self.assertEqual(requests, [{"operation": "jobs"}])
+
+    def test_live_picker_cancel_and_single_or_no_running_jobs(self):
+        table = self.job_table(("900_0", "RUNNING"), ("900_1", "RUNNING"))
+        for key in (b"q", b"\x1b", b"\x03"):
+            with self.subTest(key=key):
+                screen, status, requests = self.pick(table, [key], command="hpc-live")
+                self.assertEqual(status, 130, screen)
+                self.assertEqual(requests, [{"operation": "jobs"}])
+                self.assertIn("terminal: isig echo", screen)
+        screen, status, requests = self.pick(self.job_table(("900_0", "RUNNING")), command="hpc-live")
+        self.assertEqual(status, 0, screen)
+        self.assertNotIn("Choose a running job", screen)
+        self.assertIn("viewed 900_0", screen)
+        screen, status, requests = self.pick(self.job_table(("900_0", "PENDING")), command="hpc-live")
+        self.assertEqual(status, 1, screen)
+        self.assertIn("no running jobs to view", screen)
+        self.assertEqual(requests, [{"operation": "jobs"}])
 
     def test_jwatch_without_an_id_picks_a_running_job_with_keys(self):
         table = self.job_table(("900_2", "PENDING"), ("900_0", "RUNNING"), ("900_1", "RUNNING"),

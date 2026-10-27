@@ -14,7 +14,7 @@ PUBLIC_DOCUMENTS = (
     *(path for path in (ROOT / "LICENSE",) if path.is_file()),
     *sorted((ROOT / ".github/workflows").glob("*.yml")),
 )
-TEXT_SUFFIXES = {".md", ".py", ".sh", ".zsh", ".yml", ".yaml", ".toml"}
+TEXT_SUFFIXES = {".md", ".py", ".sh", ".zsh", ".yml", ".yaml", ".toml", ".html", ".svg"}
 TEXT_FILENAMES = {"LICENSE"}
 # Never walk VCS or tool state: .git/config holds the committer's real address.
 EXCLUDED_DIRECTORIES = {".git", ".ruff_cache", ".pytest_cache", "__pycache__", "downloads"}
@@ -90,6 +90,9 @@ class PublicReleaseTests(unittest.TestCase):
             "*.pem",
             "/downloads/",
             "jobmon-*.tar.gz",
+            "jobmon-*.html",
+            "jobmon-*.svg",
+            "jobmon-*.zip",
             "*.partial",
             "/README.pdf",
         }

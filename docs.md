@@ -6,7 +6,8 @@ or Python packages are required. Slurm remains authoritative for job state.
 
 [Setup](#setup) · [Commands](#commands) · [Configuration](#configure-the-remote-environment) ·
 [Collection](#add-persistent-collection) · [Watch](#watch-saved-history) ·
-[Archives](#fetch-and-read-offline) · [Measurements](#what-measurements-mean) ·
+[Archives](#fetch-and-read-offline) · [Live dashboard](#live-browser-dashboard) ·
+[Measurements](#what-measurements-mean) ·
 [Troubleshooting](#troubleshooting)
 
 ## Setup
@@ -87,8 +88,8 @@ interactive `jobmon` function.
 ### Deployment and upgrades
 
 Repeat `hpc-jdeploy`, review the preview, then run `hpc-jdeploy --apply` and
-`hpc-jdoctor` after updates. Deployment includes the three Python files in
-`jobmon/` and [examples/monitored-job.sh](examples/monitored-job.sh).
+`hpc-jdoctor` after updates. Deployment includes `jobmon.py`, `slurm_backend.py`,
+`collect.py`, and [examples/monitored-job.sh](examples/monitored-job.sh).
 It verifies `SHA256SUMS`, byte-compiles Python, and checks wrapper Bash syntax
 before atomically switching `~/.local/libexec/jobmon/current` to a
 content-addressed directory under `releases/`. Failed preflight leaves the
@@ -118,6 +119,8 @@ Run workstation commands after sourcing `shell/jobmon.zsh`:
 | `hpc-jwatch` | Choose a running job by ID and name. |
 | `hpc-jwatch 123456 --exit-on-completion` | Stop after wrapper completion and all final samples. |
 | `hpc-jfetch 123456 ./downloads` | Save a private history archive locally. |
+| `hpc-live` | Choose a running job and open its live CPU/memory dashboard. |
+| `hpc-live 123456` | View a running or completed job from its earliest saved samples. |
 | `hpc-jstorage-init` | Create the login-side shared-storage probe once. |
 | `hpc-jdoctor` | Check interpreter, Slurm, wrapper, storage, and probe. |
 
@@ -200,7 +203,7 @@ Workstation settings belong in your private Zsh configuration:
 | Local setting | Meaning |
 | --- | --- |
 | `HPC_JOBMON_HOST` | Required SSH destination; no default. |
-| `HPC_JOBMON_TOOLS_DIR` | Optional clone path for deployment. Normally inferred from the sourced helper, resolving symlinks. |
+| `HPC_JOBMON_TOOLS_DIR` | Optional clone path for deployment/plotting; normally inferred from the sourced helper, resolving symlinks. |
 
 History range, JSON output, watch refresh/count, and completion stopping are
 command options, rather than remote environment settings.
@@ -339,6 +342,50 @@ and listed under `ignored_storage_entries`; symlinked run directories are refuse
 Keep archives in ignored `downloads/` or outside the repository. There is no
 automatic telemetry deletion; removing the wrapper from future scripts stops
 future collection.
+
+### Live browser dashboard
+
+```zsh
+hpc-live                        # same j/k, arrows, Enter picker as hpc-jwatch
+hpc-live 123456 --interval 5
+hpc-live 123456 --no-browser     # print the local URL for manual opening
+```
+
+The command opens a local browser dashboard with a TokyoNight Storm theme.
+It loads the complete saved history from the beginning of each run, then appends
+new readings over one SSH connection. Samples from before the command started
+are included; time before collection began stays unmeasured. Slurm is queried
+once, while subsequent refreshes only read saved files.
+
+Deploy the updated reporter once with `hpc-jdeploy` and `hpc-jdeploy --apply`.
+The dashboard needs an existing local `python3` (3.8+), without extra packages.
+Its server binds only to loopback on a free port; `--port N` selects a port.
+Close the last dashboard tab or press Ctrl-C to stop viewing; collection continues.
+Tab closure has a 0.5-second grace period; normal CLI return takes about 1–2 seconds,
+including disconnect detection and SSH cleanup. Reloading within the grace keeps it open.
+`--interval` changes file refreshes (default 5 seconds), not the job's sampling rate.
+
+Choose a run and node, switch between local clock time and time since the first
+sample, and hover or tap for values. CPU shows latest, average, and maximum usage;
+memory shows current and sampled peak GiB. Gaps remain gaps, process-group scope
+stays labelled, and nodes/requeues stay separate. New data updates automatically;
+disconnections keep existing plots visible with a diagnostic. Use an explicit ID
+for completed jobs. Each **Save image + data** button downloads one ZIP for the
+selected run/node: `chart.svg`, `data.csv`, `data.json` (units and run metadata),
+and `samples.jsonl` (original collector records). Image and data share one snapshot;
+missing values stay blank/null. Update the reporter to include original JSONL samples;
+older reporters still export the plotted values as CSV/JSON. Keep exports private.
+ZIP filenames include the job ID and sanitized job name, followed by run, node,
+chart, and export time. Long names are shortened; JSON metadata retains full names.
+
+To plot an existing archive without SSH:
+
+```sh
+python3 jobmon/plot.py 123456 ./downloads/jobmon-123456.EXAMPLE.tar.gz
+```
+
+Plotting preserves cluster-account metadata and works when local/remote usernames
+or UIDs differ. Unlike the offline report reader, it does not require them to match.
 
 ## What measurements mean
 
