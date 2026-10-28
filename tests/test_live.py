@@ -464,7 +464,10 @@ class SSHAndShellTests(unittest.TestCase):
         deadline = time.monotonic() + 3
         while any(job.connection != "Live" for job in state.jobs) and time.monotonic() < deadline:
             time.sleep(0.01)
-        self.assertEqual(state.jobs[0].snapshot(), before)
+        after = state.jobs[0].snapshot()
+        self.assertEqual(after["runs"], before["runs"])
+        self.assertEqual(after["scheduler"], before["scheduler"])
+        self.assertIsNone(after["queue_status"]["state"])
         self.assertEqual([job.job_id for job in state.jobs], [JOB_ID, "456_2", "789"])
         for job in state.jobs:
             self.assertEqual(len(job.snapshot()["runs"][0]["nodes"][0]["points"]), 3)
@@ -480,13 +483,17 @@ class SSHAndShellTests(unittest.TestCase):
         discovery = live.JobDiscovery(state, "test-alias", [])
         for response in ({"schema_version": 1, "jobs": [{"job_id": "456_2", "state": "RUNNING"},
                                                        {"job_id": "../invalid", "state": "RUNNING"}]},
+                         {"schema_version": 1, "jobs": [{"job_id": "../invalid", "state": "PENDING"}]},
+                         {"schema_version": 1, "jobs": [{"job_id": JOB_ID, "state": "RUNNING"},
+                                                       {"job_id": JOB_ID, "state": "PENDING"}]},
                          {"schema_version": 1, "jobs": [None]}, {"jobs": []}, []):
             with self.subTest(response=response), patch.object(discovery, "_query", return_value=response), \
                     patch.object(live, "SSHSource") as source:
                 discovery.refresh()
                 self.assertEqual(len(state.jobs), 1)
                 source.assert_not_called()
-                self.assertIn("New-job discovery failed", state.snapshot()["discovery_error"])
+                self.assertIn("Queue refresh failed", state.snapshot()["discovery_error"])
+                self.assertIsNone(state.snapshot()["queue_status"])
         env, listing, _ = self.discovery_ssh({"exit": 23})
         with patch.dict(os.environ, env):
             discovery.refresh()
@@ -494,6 +501,38 @@ class SSHAndShellTests(unittest.TestCase):
             listing.write_text(json.dumps({"schema_version": 1, "jobs": []}))
             discovery.refresh()
         self.assertNotIn("discovery_error", state.snapshot())
+
+    def test_queue_refresh_tracks_departure_and_reappearance_with_an_explicit_job(self):
+        state = live.MultiJobState([JOB_ID])
+        for event in events():
+            state.jobs[0].apply(event)
+        before = state.snapshot()
+        discovery = live.JobDiscovery(state, "test-alias", [], follow=False)
+        env, listing, _ = self.discovery_ssh({"schema_version": 1, "jobs": [
+            {"job_id": JOB_ID, "state": "RUNNING"}, {"job_id": "456_2", "state": "RUNNING"}]})
+        with patch.dict(os.environ, env), patch.object(live, "SSHSource") as source:
+            discovery.refresh()
+            self.assertEqual(state.snapshot()["queue_status"]["state"], "RUNNING")
+            # A failed query must not turn an empty response into a departure.
+            listing.write_text(json.dumps({"exit": 23}))
+            discovery.refresh()
+            self.assertEqual(state.snapshot()["queue_status"]["state"], "RUNNING")
+            listing.write_text(json.dumps({"schema_version": 1, "jobs": []}))
+            discovery.refresh()
+            absent = state.snapshot()["queue_status"]
+            self.assertIsNone(absent["state"])
+            self.assertIsNotNone(jobmon.timestamp_seconds(absent["checked_at"]))
+            # The file stream can continue sending its original scheduler snapshot.
+            state.jobs[0].apply(events()[-1])
+            self.assertEqual(state.snapshot()["queue_status"], absent)
+            self.assertEqual(state.snapshot()["runs"], before["runs"])
+            listing.write_text(json.dumps({"schema_version": 1, "jobs": [
+                {"job_id": JOB_ID, "state": "PENDING"}]}))
+            discovery.refresh()
+            self.assertEqual(state.snapshot()["queue_status"]["state"], "PENDING")
+            self.assertNotIn("discovery_error", state.snapshot())
+            self.assertEqual(len(state.jobs), 1)
+            source.assert_not_called()
 
     def test_discovery_polls_in_background_and_cancels_a_pending_query_promptly(self):
         env, _, capture = self.discovery_ssh({"delay": 60})
@@ -674,18 +713,16 @@ class SSHAndShellTests(unittest.TestCase):
             self.assertEqual(snapshots[1]["connection"], "Connecting")
             server.return_value.serve_forever.assert_called_once()
 
-    def test_main_only_discovers_jobs_in_follow_mode_and_closes_discovery(self):
+    def test_main_always_refreshes_queue_and_only_discovers_jobs_in_follow_mode(self):
         for follow in (False, True):
             with self.subTest(follow=follow), patch.object(live, "DashboardServer"), \
                     patch.object(live, "SSHSource"), patch.object(live, "JobDiscovery") as discovery, \
                     contextlib.redirect_stdout(io.StringIO()):
                 args = [JOB_ID, "--host", "test-alias", "--no-browser"] + (["--follow"] if follow else [])
                 self.assertEqual(live.main(args), 0)
-                if follow:
-                    discovery.return_value.start.assert_called_once()
-                    discovery.return_value.close.assert_called_once()
-                else:
-                    discovery.assert_not_called()
+                self.assertEqual(discovery.call_args.kwargs, {"follow": follow})
+                discovery.return_value.start.assert_called_once()
+                discovery.return_value.close.assert_called_once()
 
     def test_without_an_id_collects_all_started_jobs_noninteractively(self):
         script = self.base / "clone/jobmon/live.py"

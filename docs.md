@@ -289,7 +289,8 @@ hpc-live 123456 --no-browser     # print the URL
 ```
 
 The dashboard loads full saved history and updates without reloading over one
-SSH stream per job. Each stream queries Slurm once, then reads files.
+SSH stream per job. Each stream queries Slurm once, then reads files; a shared
+queue check refreshes job presence every 30 seconds, including with an explicit ID.
 
 Without an ID, running/completing jobs appear as tabs; queue checks every
 30 seconds add newly started jobs and retain finished tabs. Click or use focused
@@ -302,9 +303,11 @@ and allows higher readings; memory is GiB. **Elapsed** ends at the latest sample
 and stays fixed through gaps; **Monitored**/**Sample span** label fallback times.
 
 Green success/red exit-code banners report wrapper completion; tabs mark the
-latest run. Requeues clear the message; final samples, silence, and disconnection
-alone never establish completion. **Save image + data** exports the selected
-run/node's ZIP.
+latest run. Without a wrapper result (including attached jobs), leaving the queue
+shows an amber message with final state/exit code unavailable. Queue failures,
+final samples, silence, and disconnection alone never establish completion.
+Reappearing jobs clear the queue message. **Save image + data** exports the
+selected run/node's ZIP.
 
 The workstation needs Python 3.8+ and the current remote reporter. The server is
 loopback-only; `--port N` selects a port, otherwise one is chosen. Closing the last

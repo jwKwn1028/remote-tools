@@ -18,7 +18,7 @@ import time
 from urllib.parse import urlsplit
 import webbrowser
 
-from collect import SCHEMA_VERSION, checked_name
+from collect import SCHEMA_VERSION, checked_name, utc_now
 from jobmon import MAX_LINE, MEMORY_SCOPE_NOTES
 from plot import metadata_for_plot, render_html, with_runtime, write_exports
 from slurm_backend import JobmonError, validate_job_id
@@ -51,6 +51,7 @@ class LiveState:
         self.errors = deque(maxlen=100)
         self.scheduler = None
         self.scheduler_snapshot_at = None
+        self.queue_status = None
         self.connection = "Connecting"
         self.updated_at = None
         self.last_received = time.monotonic()
@@ -168,6 +169,12 @@ class LiveState:
             self._error(message)
             self._notify()
 
+    def update_queue(self, row, checked_at):
+        with self.changed:
+            self.queue_status = {"state": row["state"] if row is not None else None,
+                                 "checked_at": checked_at}
+            self._notify()
+
     def snapshot(self):
         with self.changed:
             connection = self.connection
@@ -178,7 +185,7 @@ class LiveState:
             return copy.deepcopy(with_runtime({"job_id": self.job_id, "runs": runs, "scope_notes": MEMORY_SCOPE_NOTES,
                 "diagnostics": list(self.errors), "live": True, "connection": connection,
                 "updated_at": self.updated_at, "scheduler": self.scheduler,
-                "scheduler_snapshot_at": self.scheduler_snapshot_at}))
+                "scheduler_snapshot_at": self.scheduler_snapshot_at, "queue_status": self.queue_status}))
 
 
 class MultiJobState:
@@ -309,9 +316,10 @@ class SSHSource:
 
 
 class JobDiscovery:
-    def __init__(self, state, host, sources):
+    def __init__(self, state, host, sources, follow=True):
         self.command = ssh_command(host)
         self.state, self.host, self.sources = state, host, sources
+        self.follow = follow
         self.stopping = threading.Event()
         self.thread = None
 
@@ -349,18 +357,28 @@ class JobDiscovery:
             if (not isinstance(result, dict) or result.get("schema_version") != SCHEMA_VERSION
                     or not isinstance(result.get("jobs"), list)):
                 raise JobmonError("Malformed queue response.")
-            ids = []
+            rows = {}
             for row in result["jobs"]:
                 if not isinstance(row, dict) or not isinstance(row.get("state"), str):
                     raise JobmonError("Malformed queue job.")
-                if row["state"] in ("RUNNING", "COMPLETING"):
-                    ids.append(validate_job_id(row.get("job_id")))
-            for job_id in dict.fromkeys(ids):
+                job_id = validate_job_id(row.get("job_id"))
+                if job_id in rows and rows[job_id]["state"] != row["state"]:
+                    raise JobmonError("Conflicting queue states for job " + job_id)
+                rows[job_id] = row
+            if self.stopping.is_set():
+                return
+            checked_at = utc_now()
+            for job in self.state.jobs:
+                job.update_queue(rows.get(job.job_id), checked_at)
+            for job_id, row in rows.items():
                 if self.stopping.is_set():
                     return
+                if not self.follow or row["state"] not in ("RUNNING", "COMPLETING"):
+                    continue
                 job = self.state.add_job(job_id)
                 if job is None:
                     continue
+                job.update_queue(row, checked_at)
                 source = SSHSource(job, self.host)
                 self.sources.append(source)
                 try:
@@ -369,7 +387,7 @@ class JobDiscovery:
                     job.disconnected("Could not start remote stream: " + str(exc))
             self.state.set_discovery_error(None)
         except (OSError, ValueError, JobmonError) as exc:
-            self.state.set_discovery_error("New-job discovery failed; retrying in {} s: {}".format(
+            self.state.set_discovery_error("Queue refresh failed; retrying in {} s: {}".format(
                 DISCOVERY_INTERVAL, str(exc)[:1000]))
 
     def _run(self):
@@ -535,9 +553,8 @@ def main(argv=None):
                 if len(sources) == 1:
                     raise
                 source.state.disconnected("Could not start remote stream: " + str(exc))
-        if args.follow:
-            discovery = JobDiscovery(state, args.host, sources)
-            discovery.start()
+        discovery = JobDiscovery(state, args.host, sources, follow=args.follow)
+        discovery.start()
         print("hpc-live: " + server.url, flush=True)
         print("Close the last dashboard browser tab or press Ctrl-C to stop viewing.", flush=True)
         if not args.no_browser:

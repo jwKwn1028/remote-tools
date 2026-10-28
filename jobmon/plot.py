@@ -386,6 +386,7 @@ border-bottom:1px solid var(--line);overflow-x:auto}#job-tabs[hidden]{display:no
 #job-tabs button::before{content:"";display:inline-block;width:6px;height:6px;margin-right:8px;
 border-radius:50%;background:var(--muted)}#job-tabs button.live::before{background:var(--green)}
 #job-tabs button.warning::before{background:var(--orange)}
+#job-tabs button.unknown::before{background:var(--orange)}
 #job-tabs button.finished::before{background:var(--green)}#job-tabs button.failed::before{background:var(--red)}
 main{display:grid;grid-template-columns:260px minmax(0,1fr);min-height:calc(100vh - 45px)}
 main.sidebar-collapsed{grid-template-columns:minmax(0,1fr)}
@@ -395,6 +396,7 @@ aside h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(-
 #completion{padding:12px 14px;border:1px solid var(--green);border-left-width:3px;border-radius:5px;
 background:var(--bg-dark);color:var(--green);white-space:pre-wrap;margin:0 0 18px}
 #completion.failed{border-color:var(--red);color:var(--red)}
+#completion.unknown{border-color:var(--orange);color:var(--orange)}
 label{display:grid;gap:6px;color:var(--fg-dim);font-size:12px}
 select,button{font:inherit;padding:6px 8px;border:1px solid var(--edge);border-radius:5px;
 background:var(--bg-high);color:var(--fg-dim);min-width:0;max-width:100%}
@@ -538,10 +540,9 @@ function draw(){
  const run=data.runs[Number(byId("run").value)], node=run?.nodes[Number(byId("node").value)];
  const name=run?.job_name||jobName(data);
  byId("title").textContent="Job "+data.job_id+(name?" ("+name+")":"");
- const result=completionResult(run), completion=byId("completion");
+ const result=completionResult(data,run), completion=byId("completion");
  completion.hidden=!result;completion.className=result?.kind||"";
- const message=result?result.message+"\\nBatch wrapper result for the selected run. "+
-  "Use hpc-jreport "+data.job_id+" for final Slurm state.":"";
+ const message=result?.message||"";
  if(completion.textContent!==message)completion.textContent=message;
  const runtime=run?.runtime, labels={slurm:"Elapsed",monitoring:"Monitored",samples:"Sample span"};
  byId("runtime").textContent=runtime?.seconds!=null?labels[runtime.source]+" "+runtime.display:"Elapsed unavailable";
@@ -561,9 +562,10 @@ function draw(){
  if(missing.length)byId("context").textContent+=" · Missing: "+missing.join(", ");
  byId("scope").textContent=node?node.scopes.map(scope=>scope+": "+
   (data.scope_notes[scope]||"CPU/memory unavailable; see diagnostics")).join("; "):"No saved samples yet.";
- const queue=data.scheduler?.queue?.[0], snapshot=data.scheduler_snapshot_at;
- byId("scheduler").textContent=queue?"Slurm snapshot: "+queue.state+
-  (snapshot?" at "+new Date(snapshot).toLocaleTimeString():"")+" · not refreshed while viewing":"";
+ const queue=data.scheduler?.queue?.[0], snapshot=data.scheduler_snapshot_at, status=data.queue_status;
+ byId("scheduler").textContent=status?"Slurm queue: "+(status.state||"job not present")+
+  " at "+new Date(status.checked_at).toLocaleTimeString():queue?"Initial Slurm snapshot: "+queue.state+
+  (snapshot?" at "+new Date(snapshot).toLocaleTimeString():""):"";
  byId("diagnostics").textContent=[...data.diagnostics,...(discoveryError?[discoveryError]:[])].join("\\n")||
   "No recorded diagnostics.";
  if(data.live)byId("notice").textContent="Live saved samples. Hover or tap for values. "+
@@ -586,11 +588,20 @@ function selectRun(preferredNode){
 function jobName(job){
  return job.scheduler?.queue?.[0]?.job_name||[...job.runs].reverse().find(run=>run.job_name)?.job_name||"";
 }
-function completionResult(run){
- if(!Number.isInteger(run?.exit_code))return null;
- const code=run.exit_code;
- return code===0?{kind:"finished",label:"finished",message:"Workload finished (exit 0)."}:
-  {kind:"failed",label:"exit "+code,message:"Workload exited with code "+code+". Check the job's output/error logs."};
+function completionResult(job,run){
+ if(Number.isInteger(run?.exit_code)){
+  const code=run.exit_code, detail="\\nBatch wrapper result for the selected run. "+
+   "Use hpc-jreport "+job.job_id+" for final Slurm state.";
+  return code===0?{kind:"finished",label:"finished",message:"Workload finished (exit 0)."+detail}:
+   {kind:"failed",label:"exit "+code,message:"Workload exited with code "+code+
+    ". Check the job's output/error logs."+detail};
+ }
+ const status=job.queue_status;
+ if(!status || status.state!==null || run!==job.runs[job.runs.length-1])return null;
+ const checked=Date.parse(status.checked_at), created=Date.parse(run?.metadata?.created_at);
+ if(!Number.isFinite(checked) || (Number.isFinite(created) && created>checked))return null;
+ return {kind:"unknown",label:"left queue",message:"Job is no longer in the Slurm queue.\\n"+
+  "Final state and exit code are unavailable. Check the job's output/error logs."};
 }
 function rememberJob(){
  if(!jobs.length || !data.job_id)return;
@@ -640,7 +651,7 @@ function renderJobTabs(){
    tabs.appendChild(button);
   }
   const name=jobName(job), selected=job.job_id===selectedJob;
-  const result=completionResult(job.runs[job.runs.length-1]);
+  const result=completionResult(job,job.runs[job.runs.length-1]);
   button.textContent=job.job_id+(result?" · "+result.label:"")+(name?" ("+name+")":"");
   button.title=button.textContent+" · "+(job.connection||"Saved snapshot");
   button.setAttribute("aria-selected",String(selected));button.tabIndex=selected?0:-1;
