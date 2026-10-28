@@ -166,6 +166,172 @@ class LiveStateTests(unittest.TestCase):
         self.assertIn("synthetic connection lost", state.snapshot()["diagnostics"])
 
 
+class DesktopNotificationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.notifier = live.DesktopNotifier()
+        self.addCleanup(self.notifier.close)
+        self.group = live.MultiJobState([JOB_ID, "456_2"])
+        self.group.notifier = self.notifier
+
+    def load(self, job, code=None, name="synthetic simulation"):
+        packets = events(job_id=job.job_id)
+        packets[0]["metadata"].update(created_at="2026-09-01T00:00:02+00:00", job_name=name)
+        packets[-1]["scheduler"]["queue"][0].update(elapsed="2:40:10", job_name=name)
+        if code is not None:
+            packets[-1]["runs"] = [{"run_id": RUN_ID, "completion": {
+                "job_id": job.job_id, "run_id": RUN_ID, "workload_exit_code": code}}]
+        for event in packets:
+            job.apply(event)
+
+    def finish(self, job, code=0, run_id=RUN_ID):
+        status = dict(events(job_id=job.job_id)[-1], scheduler=None)
+        status["runs"] = [{"run_id": run_id, "completion": {
+            "job_id": job.job_id, "run_id": run_id, "workload_exit_code": code}}]
+        job.apply(status)
+
+    def wait_for(self, predicate):
+        deadline = time.monotonic() + 3
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(predicate())
+
+    def fake_notify(self, delay=0, status=0):
+        capture = self.base / "notification.json"
+        fake = self.base / "notify-send"
+        fake.write_text("#!" + sys.executable + "\nimport json,os,pathlib,sys,time\n"
+                        "pathlib.Path(os.environ['NOTIFY_CAPTURE']).write_text(\n"
+                        " json.dumps({'args':sys.argv[1:],'pid':os.getpid()}))\n"
+                        "time.sleep(float(os.environ['NOTIFY_DELAY']))\n"
+                        "sys.stderr.write('synthetic notification failure')\n"
+                        "sys.exit(int(os.environ['NOTIFY_EXIT']))\n")
+        fake.chmod(0o700)
+        return capture, {"PATH": str(self.base) + os.pathsep + os.environ["PATH"],
+                         "NOTIFY_CAPTURE": str(capture), "NOTIFY_DELAY": str(delay), "NOTIFY_EXIT": str(status)}
+
+    def test_wrapper_end_notifies_each_job_once_with_only_name_and_elapsed(self):
+        for index, job in enumerate(self.group.jobs):
+            self.load(job)
+            self.assertEqual(self.notifier.pending.qsize(), index)
+            job.apply(events([dict(sample(90, 60), final=True)], job_id=job.job_id)[1])
+            self.assertEqual(self.notifier.pending.qsize(), index)
+            self.finish(job, code=True)
+            self.assertEqual(self.notifier.pending.qsize(), index)
+            for code in (0, 0, 137):
+                self.finish(job, code)
+            job.update_queue(None, "2026-09-01T00:02:00+00:00")
+            job.disconnected("synthetic connection lost")
+        self.assertEqual(self.notifier.pending.qsize(), 2)
+        for job in self.group.jobs:
+            self.assertEqual(self.notifier.pending.get_nowait(), (job, "synthetic simulation", "Elapsed 2:40:40"))
+
+    def test_attached_end_uses_queue_departure_without_inventing_an_exit_code(self):
+        job = self.group.jobs[0]
+        self.load(job)
+        job.update_queue({"state": "RUNNING"}, "2026-09-01T00:01:30+00:00")
+        job.disconnected("synthetic connection lost")
+        job.apply(events([dict(sample(90, 60), final=True)])[1])
+        self.assertTrue(self.notifier.pending.empty())
+        job.update_queue(None, "2026-09-01T00:02:00+00:00")
+        self.assertEqual(self.notifier.pending.get_nowait(), (job, "synthetic simulation", "Elapsed 2:40:40"))
+        self.assertIsNone(job.snapshot()["runs"][0]["exit_code"])
+        self.finish(job)
+        job.update_queue(None, "2026-09-01T00:03:00+00:00")
+        self.assertTrue(self.notifier.pending.empty())
+
+    def test_existing_completions_are_not_replayed_when_history_is_opened(self):
+        for job, code in zip(self.group.jobs, (0, 137)):
+            self.load(job, code=code)
+            job.update_queue(None, "2026-09-01T00:02:00+00:00")
+            self.finish(job, code)
+        self.assertTrue(self.notifier.pending.empty())
+
+    def test_queue_departure_during_initial_history_waits_for_name_and_elapsed(self):
+        job = self.group.jobs[0]
+        job.update_queue(None, "2026-09-01T00:02:00+00:00")
+        self.assertTrue(self.notifier.pending.empty())
+        self.load(job)
+        self.assertEqual(self.notifier.pending.get_nowait(), (job, "synthetic simulation", "Elapsed 2:40:10"))
+
+    def test_requeue_does_not_inherit_an_old_departure_and_can_notify_again(self):
+        job = self.group.jobs[0]
+        self.load(job)
+        job.update_queue(None, "2026-09-01T00:02:00+00:00")
+        self.notifier.pending.get_nowait()
+        second = "20260901T000500Z-r1-abcdef012345"
+        meta = dict(metadata(second), created_at="2026-09-01T00:05:00+00:00")
+        job.apply(dict(events()[0], metadata=meta))
+        job.apply(dict(events()[-1], scheduler=None))
+        self.assertTrue(self.notifier.pending.empty())
+        job.update_queue({"state": "RUNNING"}, "2026-09-01T00:06:00+00:00")
+        self.finish(job, code=137, run_id=second)
+        self.assertEqual(self.notifier.pending.get_nowait(), (job, "synthetic simulation", "Elapsed unavailable"))
+        self.finish(job, code=137, run_id=second)
+        self.assertTrue(self.notifier.pending.empty())
+
+    def test_no_saved_samples_keep_elapsed_unavailable(self):
+        job = self.group.jobs[0]
+        job.apply(events()[-1])
+        job.scheduler["queue"][0]["job_name"] = "synthetic pending samples"
+        job.update_queue(None, "2026-09-01T00:02:00+00:00")
+        self.assertEqual(self.notifier.pending.get_nowait(),
+                         (job, "synthetic pending samples", "Elapsed unavailable"))
+
+    def test_native_popup_matches_reminder_options_and_escapes_job_names(self):
+        capture, env = self.fake_notify()
+        job = self.group.jobs[0]
+        self.load(job, name="<b>simulation</b> & $(touch unsafe)\n--urgent")
+        with patch.dict(os.environ, env):
+            self.notifier.start()
+            self.finish(job)
+            self.wait_for(capture.exists)
+            self.notifier.close()
+        self.assertEqual(json.loads(capture.read_text())["args"], [
+            "--app-name=hpc-live", "--urgency=normal", "--expire-time=0",
+            "--hint=boolean:resident:true", "--hint=boolean:transient:false", "--category=jobmon.finished",
+            "--icon=appointment-soon", "--", "&lt;b&gt;simulation&lt;/b&gt; &amp; $(touch unsafe)\\n--urgent",
+            "Elapsed 2:40:10"])
+        self.assertFalse((self.base / "unsafe").exists())
+
+    def test_unavailable_notification_support_keeps_history_and_reports_diagnostics(self):
+        for failure in ("missing", "exit", "timeout"):
+            with self.subTest(failure=failure):
+                notifier = live.DesktopNotifier()
+                self.group.notifier = notifier
+                self.addCleanup(notifier.close)
+                job = live.MultiJobState([JOB_ID]).jobs[0]
+                job.group.notifier = notifier
+                self.load(job)
+                before = job.snapshot()["runs"]
+                _, env = self.fake_notify(delay=60 if failure == "timeout" else 0, status=23)
+                if failure == "missing":
+                    env["PATH"] = str(self.base / "absent")
+                with patch.dict(os.environ, env), patch.object(live, "NOTIFICATION_TIMEOUT", 0.15):
+                    notifier.start()
+                    self.finish(job)
+                    self.wait_for(lambda: any("Desktop notification unavailable" in error for error in job.errors))
+                    notifier.close()
+                self.assertEqual(job.connection, "Live")
+                self.assertEqual(job.snapshot()["runs"][0]["nodes"], before[0]["nodes"])
+                self.assertEqual(job.snapshot()["runs"][0]["exit_code"], 0)
+
+    def test_closing_viewer_cancels_a_hung_notification_promptly(self):
+        capture, env = self.fake_notify(delay=60)
+        job = self.group.jobs[0]
+        self.load(job)
+        with patch.dict(os.environ, env):
+            self.notifier.start()
+            self.finish(job)
+            self.wait_for(capture.exists)
+            started = time.monotonic()
+            self.notifier.close()
+            self.assertLess(time.monotonic() - started, 1)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(json.loads(capture.read_text())["pid"], 0)
+
+
 class MultiJobStateTests(unittest.TestCase):
     def test_new_jobs_notify_without_replacing_saved_history(self):
         state = live.MultiJobState([JOB_ID], interval=2)
@@ -597,11 +763,13 @@ class SSHAndShellTests(unittest.TestCase):
     def test_zip_mode_never_opens_a_browser_or_local_server(self):
         env, _ = self.zip_ssh(events())
         with patch.dict(os.environ, env), patch.object(live, "DashboardServer") as server, \
-                patch.object(live.webbrowser, "open") as browser, contextlib.redirect_stdout(io.StringIO()):
+                patch.object(live.webbrowser, "open") as browser, patch.object(live, "DesktopNotifier") as notifier, \
+                contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(live.main([JOB_ID, "--host", "test-alias", "--zip",
                                         "--output-dir", str(self.base / "zip")]), 0)
         server.assert_not_called()
         browser.assert_not_called()
+        notifier.assert_not_called()
 
     def test_zip_mode_rejects_failed_partial_and_timed_out_snapshots(self):
         for label, packets, status, delay in (("failed", events(), 23, 0),
@@ -717,12 +885,15 @@ class SSHAndShellTests(unittest.TestCase):
         for follow in (False, True):
             with self.subTest(follow=follow), patch.object(live, "DashboardServer"), \
                     patch.object(live, "SSHSource"), patch.object(live, "JobDiscovery") as discovery, \
+                    patch.object(live, "DesktopNotifier") as notifier, \
                     contextlib.redirect_stdout(io.StringIO()):
                 args = [JOB_ID, "--host", "test-alias", "--no-browser"] + (["--follow"] if follow else [])
                 self.assertEqual(live.main(args), 0)
                 self.assertEqual(discovery.call_args.kwargs, {"follow": follow})
                 discovery.return_value.start.assert_called_once()
                 discovery.return_value.close.assert_called_once()
+                notifier.return_value.start.assert_called_once()
+                notifier.return_value.close.assert_called_once()
 
     def test_without_an_id_collects_all_started_jobs_noninteractively(self):
         script = self.base / "clone/jobmon/live.py"

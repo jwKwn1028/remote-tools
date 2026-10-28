@@ -6,9 +6,11 @@ import bisect
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import copy
+import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import queue
 import re
 import secrets
 import subprocess
@@ -19,7 +21,7 @@ from urllib.parse import urlsplit
 import webbrowser
 
 from collect import SCHEMA_VERSION, checked_name, utc_now
-from jobmon import MAX_LINE, MEMORY_SCOPE_NOTES
+from jobmon import MAX_LINE, MEMORY_SCOPE_NOTES, display_job_name, timestamp_seconds
 from plot import metadata_for_plot, render_html, with_runtime, write_exports
 from slurm_backend import JobmonError, validate_job_id
 
@@ -31,6 +33,7 @@ MAX_EVENT_LINE = 4 * MAX_LINE
 SNAPSHOT_TIMEOUT = 120
 DISCOVERY_INTERVAL = 30
 DISCOVERY_TIMEOUT = 30
+NOTIFICATION_TIMEOUT = 5
 
 
 def ssh_command(host):
@@ -52,6 +55,7 @@ class LiveState:
         self.scheduler = None
         self.scheduler_snapshot_at = None
         self.queue_status = None
+        self.received_status = False
         self.connection = "Connecting"
         self.updated_at = None
         self.last_received = time.monotonic()
@@ -102,6 +106,10 @@ class LiveState:
             else:
                 raise JobmonError("Unknown live stream event.")
             self.last_received = time.monotonic()
+            if kind == "status":
+                self.received_status = True
+                if self.group is not None and self.group.notifier is not None:
+                    self.group.notifier.observe(self)
             self._notify()
 
     def _notify(self):
@@ -173,6 +181,8 @@ class LiveState:
         with self.changed:
             self.queue_status = {"state": row["state"] if row is not None else None,
                                  "checked_at": checked_at}
+            if self.group is not None and self.group.notifier is not None:
+                self.group.notifier.observe(self)
             self._notify()
 
     def snapshot(self):
@@ -197,6 +207,7 @@ class MultiJobState:
         self.version = 0
         self.interval = interval
         self.discovery_error = None
+        self.notifier = None
         self.jobs = [LiveState(job_id, interval, group=self) for job_id in ids]
 
     def add_job(self, job_id):
@@ -226,6 +237,102 @@ class MultiJobState:
             if self.discovery_error:
                 result["discovery_error"] = self.discovery_error
             return result
+
+
+class DesktopNotifier:
+    def __init__(self):
+        self.pending = queue.Queue(maxsize=128)
+        self.stopping = threading.Event()
+        self.initialized = set()
+        self.active = set()
+        self.seen = set()
+        self.thread = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def observe(self, job):
+        # Called under the shared state lock, after a complete status or queue check.
+        status = job.queue_status
+        states = [row.get("state") for row in (job.scheduler or {}).get("queue", [])]
+        if status is not None:
+            states.append(status["state"])
+        if any(state in ("RUNNING", "COMPLETING") for state in states):
+            self.active.add(job.job_id)
+        if not job.received_status:
+            return
+        if job.job_id not in self.initialized:
+            self.initialized.add(job.job_id)
+            self.seen.update((job.job_id, run_id) for run_id, run in job.runs.items()
+                             if type(run["exit_code"]) is int)
+        run_id = max(job.runs, default=None)
+        run = job.runs.get(run_id)
+        key = (job.job_id, run_id)
+        if key in self.seen:
+            return
+        completed = run is not None and type(run["exit_code"]) is int
+        if not completed:
+            if status is None or status["state"] is not None or job.job_id not in self.active:
+                return
+            checked = timestamp_seconds(status["checked_at"])
+            created = timestamp_seconds(run["metadata"].get("created_at")) if run else None
+            if checked is None or (created is not None and created > checked):
+                return
+        snapshot = job.snapshot()
+        saved = snapshot["runs"][-1] if run is not None else {}
+        name = saved.get("job_name") or next((row.get("job_name") for row in
+                                             (job.scheduler or {}).get("queue", []) if row.get("job_name")), None)
+        runtime = saved.get("runtime", {})
+        elapsed = (runtime["display"] if runtime.get("source") == "slurm" and runtime.get("seconds") is not None
+                   else "unavailable")
+        try:
+            self.pending.put_nowait((job, display_job_name(name)[:1000], "Elapsed " + elapsed))
+        except queue.Full:
+            job._error("Desktop notification queue is full; retrying on the next status update.")
+        else:
+            self.seen.add(key)
+
+    def _send(self, name, elapsed):
+        command = ["notify-send", "--app-name=hpc-live", "--urgency=normal", "--expire-time=0",
+                   "--hint=boolean:resident:true", "--hint=boolean:transient:false",
+                   "--category=jobmon.finished", "--icon=appointment-soon", "--",
+                   html.escape(name, quote=False), html.escape(elapsed, quote=False)]
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   universal_newlines=True)
+        deadline = time.monotonic() + NOTIFICATION_TIMEOUT
+        try:
+            while not self.stopping.is_set():
+                try:
+                    _, error = process.communicate(timeout=0.1)
+                    if process.returncode:
+                        raise JobmonError("notify-send exited {}: {}".format(process.returncode, error.strip()[:1000]))
+                    return
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise JobmonError("notify-send timed out.")
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+
+    def _run(self):
+        while not self.stopping.is_set():
+            try:
+                job, name, elapsed = self.pending.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._send(name, elapsed)
+            except (OSError, JobmonError) as exc:
+                with job.changed:
+                    job._error("Desktop notification unavailable; check workstation notify-send: " + str(exc))
+                    job._notify()
+
+    def close(self):
+        self.stopping.set()
+        if self.thread is not None:
+            self.thread.join()
 
 
 class SSHSource:
@@ -525,7 +632,7 @@ def main(argv=None):
     parser.add_argument("--output-dir", default="downloads", help="private ZIP output directory")
     parser.add_argument("--days", type=int, default=30, help="accounting lookback for ZIP export")
     args = parser.parse_args(argv)
-    sources, server, discovery = [], None, None
+    sources, server, discovery, notifier = [], None, None, None
     try:
         if not 1 <= args.interval <= 86400 or not 0 <= args.port <= 65535:
             raise JobmonError("Interval must be 1–86400 seconds and port must be 0–65535.")
@@ -544,6 +651,9 @@ def main(argv=None):
             for path in write_exports(state.snapshot(), args.output_dir):
                 print(path, flush=True)
             return 0
+        notifier = DesktopNotifier()
+        state.notifier = notifier
+        notifier.start()
         sources = [SSHSource(job, args.host) for job in state.jobs]
         server = DashboardServer(state, args.port)
         for source in sources:
@@ -575,6 +685,8 @@ def main(argv=None):
         if sources:
             with ThreadPoolExecutor(max_workers=min(32, len(sources))) as closing:
                 list(closing.map(lambda source: source.close(), sources))
+        if notifier is not None:
+            notifier.close()
 
 
 if __name__ == "__main__":
