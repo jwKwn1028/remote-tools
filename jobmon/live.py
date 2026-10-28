@@ -246,6 +246,7 @@ class DesktopNotifier:
         self.initialized = set()
         self.active = set()
         self.seen = set()
+        self.inflight = set()
         self.thread = None
 
     def start(self):
@@ -269,7 +270,7 @@ class DesktopNotifier:
         run_id = max(job.runs, default=None)
         run = job.runs.get(run_id)
         key = (job.job_id, run_id)
-        if key in self.seen:
+        if key in self.seen or key in self.inflight:
             return
         completed = run is not None and type(run["exit_code"]) is int
         if not completed:
@@ -287,11 +288,11 @@ class DesktopNotifier:
         elapsed = (runtime["display"] if runtime.get("source") == "slurm" and runtime.get("seconds") is not None
                    else "unavailable")
         try:
-            self.pending.put_nowait((job, display_job_name(name)[:1000], "Elapsed " + elapsed))
+            self.pending.put_nowait((job, key, display_job_name(name)[:1000], "Elapsed " + elapsed))
         except queue.Full:
             job._error("Desktop notification queue is full; retrying on the next status update.")
         else:
-            self.seen.add(key)
+            self.inflight.add(key)
 
     def _send(self, name, elapsed):
         command = ["notify-send", "--app-name=hpc-live", "--urgency=normal", "--expire-time=0",
@@ -307,7 +308,7 @@ class DesktopNotifier:
                     _, error = process.communicate(timeout=0.1)
                     if process.returncode:
                         raise JobmonError("notify-send exited {}: {}".format(process.returncode, error.strip()[:1000]))
-                    return
+                    return True
                 except subprocess.TimeoutExpired:
                     if time.monotonic() >= deadline:
                         raise JobmonError("notify-send timed out.")
@@ -315,18 +316,25 @@ class DesktopNotifier:
             if process.poll() is None:
                 process.kill()
             process.communicate()
+        return False
 
     def _run(self):
         while not self.stopping.is_set():
             try:
-                job, name, elapsed = self.pending.get(timeout=0.1)
+                job, key, name, elapsed = self.pending.get(timeout=0.1)
             except queue.Empty:
                 continue
+            delivered, error = False, None
             try:
-                self._send(name, elapsed)
+                delivered = self._send(name, elapsed)
             except (OSError, JobmonError) as exc:
-                with job.changed:
-                    job._error("Desktop notification unavailable; check workstation notify-send: " + str(exc))
+                error = "Desktop notification unavailable; check workstation notify-send: " + str(exc)
+            with job.changed:
+                self.inflight.discard(key)
+                if delivered:
+                    self.seen.add(key)
+                elif error:
+                    job._error(error + "; retrying on the next status update.")
                     job._notify()
 
     def close(self):

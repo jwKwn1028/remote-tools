@@ -225,7 +225,8 @@ class DesktopNotificationTests(unittest.TestCase):
             job.disconnected("synthetic connection lost")
         self.assertEqual(self.notifier.pending.qsize(), 2)
         for job in self.group.jobs:
-            self.assertEqual(self.notifier.pending.get_nowait(), (job, "synthetic simulation", "Elapsed 2:40:40"))
+            self.assertEqual(self.notifier.pending.get_nowait(),
+                             (job, (job.job_id, RUN_ID), "synthetic simulation", "Elapsed 2:40:40"))
 
     def test_attached_end_uses_queue_departure_without_inventing_an_exit_code(self):
         job = self.group.jobs[0]
@@ -235,7 +236,8 @@ class DesktopNotificationTests(unittest.TestCase):
         job.apply(events([dict(sample(90, 60), final=True)])[1])
         self.assertTrue(self.notifier.pending.empty())
         job.update_queue(None, "2026-09-01T00:02:00+00:00")
-        self.assertEqual(self.notifier.pending.get_nowait(), (job, "synthetic simulation", "Elapsed 2:40:40"))
+        self.assertEqual(self.notifier.pending.get_nowait(),
+                         (job, (JOB_ID, RUN_ID), "synthetic simulation", "Elapsed 2:40:40"))
         self.assertIsNone(job.snapshot()["runs"][0]["exit_code"])
         self.finish(job)
         job.update_queue(None, "2026-09-01T00:03:00+00:00")
@@ -253,7 +255,8 @@ class DesktopNotificationTests(unittest.TestCase):
         job.update_queue(None, "2026-09-01T00:02:00+00:00")
         self.assertTrue(self.notifier.pending.empty())
         self.load(job)
-        self.assertEqual(self.notifier.pending.get_nowait(), (job, "synthetic simulation", "Elapsed 2:40:10"))
+        self.assertEqual(self.notifier.pending.get_nowait(),
+                         (job, (JOB_ID, RUN_ID), "synthetic simulation", "Elapsed 2:40:10"))
 
     def test_requeue_does_not_inherit_an_old_departure_and_can_notify_again(self):
         job = self.group.jobs[0]
@@ -267,7 +270,8 @@ class DesktopNotificationTests(unittest.TestCase):
         self.assertTrue(self.notifier.pending.empty())
         job.update_queue({"state": "RUNNING"}, "2026-09-01T00:06:00+00:00")
         self.finish(job, code=137, run_id=second)
-        self.assertEqual(self.notifier.pending.get_nowait(), (job, "synthetic simulation", "Elapsed unavailable"))
+        self.assertEqual(self.notifier.pending.get_nowait(),
+                         (job, (JOB_ID, second), "synthetic simulation", "Elapsed unavailable"))
         self.finish(job, code=137, run_id=second)
         self.assertTrue(self.notifier.pending.empty())
 
@@ -277,7 +281,27 @@ class DesktopNotificationTests(unittest.TestCase):
         job.scheduler["queue"][0]["job_name"] = "synthetic pending samples"
         job.update_queue(None, "2026-09-01T00:02:00+00:00")
         self.assertEqual(self.notifier.pending.get_nowait(),
-                         (job, "synthetic pending samples", "Elapsed unavailable"))
+                         (job, (JOB_ID, None), "synthetic pending samples", "Elapsed unavailable"))
+
+    def test_failed_delivery_retries_and_deduplicates_only_after_success(self):
+        capture, env = self.fake_notify(status=23)
+        job = self.group.jobs[0]
+        key = (JOB_ID, RUN_ID)
+        self.load(job)
+        with patch.dict(os.environ, env):
+            self.notifier.start()
+            self.finish(job)
+            self.wait_for(lambda: any("retrying on the next status update" in error for error in job.errors))
+            self.assertNotIn(key, self.notifier.seen)
+            self.assertNotIn(key, self.notifier.inflight)
+            failed_pid = json.loads(capture.read_text())["pid"]
+            os.environ["NOTIFY_EXIT"] = "0"
+            self.finish(job)
+            self.wait_for(lambda: key in self.notifier.seen)
+            self.assertNotEqual(json.loads(capture.read_text())["pid"], failed_pid)
+            self.finish(job)
+            self.assertTrue(self.notifier.pending.empty())
+            self.notifier.close()
 
     def test_native_popup_matches_reminder_options_and_escapes_job_names(self):
         capture, env = self.fake_notify()

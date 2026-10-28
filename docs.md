@@ -293,7 +293,8 @@ Failed queries, final samples, silence, or disconnection alone never prove compl
 While viewing, each newly ended run sends one popup: job name and **Elapsed**
 through the latest sample. Attached jobs notify on queue departure with unknown
 outcome; old completions do not replay. `notify-send` uses your desktop theme,
-requests persistence until clicked, and reports missing support in diagnostics.
+requests persistence until clicked, and reports delivery failures in diagnostics.
+Failed sends retry on the next status update.
 
 Workstation: Python 3.8+, current reporter. Server: loopback-only, random port
 unless `--port N`. Last-tab closure has a 0.5-second grace (CLI return: 1–2 seconds).

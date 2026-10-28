@@ -600,8 +600,9 @@ function completionResult(job,run){
  if(!status || status.state!==null || run!==job.runs[job.runs.length-1])return null;
  const checked=Date.parse(status.checked_at), created=Date.parse(run?.metadata?.created_at);
  if(!Number.isFinite(checked) || (Number.isFinite(created) && created>checked))return null;
- return {kind:"unknown",label:"left queue",message:"Job is no longer in the Slurm queue.\\n"+
-  "Final state and exit code are unavailable. Check the job's output/error logs."};
+ const detail=run?.metadata?.attachment?"Attached monitoring cannot record the workload's exit code.":
+  "No workload exit code was recorded by this monitor.";
+ return {kind:"unknown",label:"left queue",message:"Job left the Slurm queue.\\n"+detail};
 }
 function rememberJob(){
  if(!jobs.length || !data.job_id)return;
