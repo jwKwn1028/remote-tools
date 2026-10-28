@@ -67,7 +67,7 @@ def csv_cell(value):
     return '"' + text.replace('"', '""') + '"'
 
 
-def svg_chart(chart, points, axis="clock"):
+def svg_chart(chart, points, axis="elapsed"):
     """Workstation SVG counterpart of the browser renderer, using the same series."""
     root = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg", "id": chart, "width": "1000", "height": "280",
                               "viewBox": "0 0 1000 280", "role": "img",
@@ -134,7 +134,7 @@ def svg_chart(chart, points, axis="clock"):
     return ET.tostring(root, encoding="unicode")
 
 
-def export_files(data, run, node, chart, captured=None, axis="clock", timezone_name=None):
+def export_files(data, run, node, chart, captured=None, axis="elapsed", timezone_name=None):
     validate_job_id(data["job_id"])
     if not node["points"]:
         raise JobmonError("No saved samples to export.")
@@ -426,8 +426,8 @@ aria-hidden="true" focusable="false"><rect x="3" y="3" width="18" height="18" rx
 <div class="controls">
 <label>Run<select id="run"></select></label>
 <label>Node<select id="node"></select></label>
-<label>Time axis<select id="axis"><option value="clock">Local date/time</option>
-<option value="elapsed">Time since first sample</option></select></label>
+<label>Time axis<select id="axis"><option value="elapsed">Time since first sample</option>
+<option value="clock">Local date/time</option></select></label>
 </div>
 <p id="context"></p>
 <p id="scheduler"></p><small id="scope"></small>
@@ -452,7 +452,7 @@ Wrapper exit codes do not establish final Slurm state. All assets stay local.</s
 <script>
 "use strict";
 let data=JSON.parse(document.getElementById("data").textContent);
-let jobs=[], selectedJob=null;
+let jobs=[], selectedJob=null, discoveryError="";
 const jobViews=new Map();
 const byId=id=>document.getElementById(id), ns="http://www.w3.org/2000/svg";
 const exportSpec=__JOBMON_EXPORT_SPEC__;
@@ -564,7 +564,8 @@ function draw(){
  const queue=data.scheduler?.queue?.[0], snapshot=data.scheduler_snapshot_at;
  byId("scheduler").textContent=queue?"Slurm snapshot: "+queue.state+
   (snapshot?" at "+new Date(snapshot).toLocaleTimeString():"")+" · not refreshed while viewing":"";
- byId("diagnostics").textContent=data.diagnostics.join("\\n")||"No recorded diagnostics.";
+ byId("diagnostics").textContent=[...data.diagnostics,...(discoveryError?[discoveryError]:[])].join("\\n")||
+  "No recorded diagnostics.";
  if(data.live)byId("notice").textContent="Live saved samples. Hover or tap for values. "+
   "CPU averages cover sampled intervals only. Missing readings remain gaps. Memory peaks stay per node. "+
   "Closing the last browser tab stops viewing, while workload collection continues.";
@@ -605,7 +606,7 @@ function showJob(){
  data.runs.forEach((run,index)=>option(byId("run"),index,run.run_id));
  let index=view && !view.following?data.runs.findIndex(run=>run.run_id===view.run):data.runs.length-1;
  if(index<0)index=data.runs.length-1;
- byId("run").value=index;byId("axis").value=view?.axis||"clock";
+ byId("run").value=index;byId("axis").value=view?.axis||"elapsed";
  byId("export-status").textContent=view?.exportStatus||"";
  selectRun(view?.node);
 }
@@ -647,14 +648,16 @@ function renderJobTabs(){
  }
 }
 function update(next){
- const previous=data;
+ const previous=data, previousError=discoveryError, hadSelection=selectedJob!==null;
+ discoveryError=next.discovery_error||"";
  rememberJob();jobs=next.jobs||[next];
  if(!jobs.some(job=>job.job_id===selectedJob))selectedJob=jobs[0].job_id;
  renderJobTabs();
  const selected=jobs.find(job=>job.job_id===selectedJob);
  // Background jobs can update without disturbing the selected chart or hover.
- if(previous.job_id===selectedJob && selected.version!==undefined && previous.version===selected.version &&
-    previous.connection===selected.connection)return;
+ if(hadSelection && previous.job_id===selectedJob && selected.version!==undefined &&
+    previous.version===selected.version && previous.connection===selected.connection &&
+    previousError===discoveryError)return;
  showJob();
 }
 byId("run").onchange=()=>selectRun();byId("node").onchange=draw;byId("axis").onchange=draw;

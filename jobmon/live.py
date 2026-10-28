@@ -29,6 +29,15 @@ REMOTE_COMMAND = ('if [ -r "$HOME/.config/jobmon/env.sh" ]; then . "$HOME/.confi
 # Allow for JSON escaping when raw samples are nested inside events.
 MAX_EVENT_LINE = 4 * MAX_LINE
 SNAPSHOT_TIMEOUT = 120
+DISCOVERY_INTERVAL = 30
+DISCOVERY_TIMEOUT = 30
+
+
+def ssh_command(host):
+    if not re.fullmatch(r"[A-Za-z0-9_.@:][A-Za-z0-9_.@:-]*", host or ""):
+        raise JobmonError("Use a valid SSH config alias or user@host.")
+    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2", "--", host, REMOTE_COMMAND]
 
 
 class LiveState:
@@ -179,19 +188,42 @@ class MultiJobState:
             raise JobmonError("Choose at least one job; duplicate job IDs are not allowed.")
         self.changed = threading.Condition()
         self.version = 0
+        self.interval = interval
+        self.discovery_error = None
         self.jobs = [LiveState(job_id, interval, group=self) for job_id in ids]
+
+    def add_job(self, job_id):
+        job_id = validate_job_id(job_id)
+        with self.changed:
+            if any(job.job_id == job_id for job in self.jobs):
+                return None
+            job = LiveState(job_id, self.interval, group=self)
+            self.jobs.append(job)
+            self.version += 1
+            self.changed.notify_all()
+            return job
+
+    def set_discovery_error(self, message):
+        with self.changed:
+            if self.discovery_error != message:
+                self.discovery_error = message
+                self.version += 1
+                self.changed.notify_all()
 
     def snapshot(self):
         with self.changed:
             if len(self.jobs) == 1:
-                return self.jobs[0].snapshot()
-            return {"live": True, "jobs": [dict(job.snapshot(), version=job.version) for job in self.jobs]}
+                result = self.jobs[0].snapshot()
+            else:
+                result = {"live": True, "jobs": [dict(job.snapshot(), version=job.version) for job in self.jobs]}
+            if self.discovery_error:
+                result["discovery_error"] = self.discovery_error
+            return result
 
 
 class SSHSource:
     def __init__(self, state, host, count=None, days=30):
-        if not re.fullmatch(r"[A-Za-z0-9_.@:][A-Za-z0-9_.@:-]*", host or ""):
-            raise JobmonError("Use a valid SSH config alias or user@host.")
+        self.command = ssh_command(host)
         self.state = state
         self.host = host
         self.count = count
@@ -204,8 +236,7 @@ class SSHSource:
 
     def start(self):
         self.process = subprocess.Popen(
-            ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
-             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2", "--", self.host, REMOTE_COMMAND],
+            self.command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True, bufsize=1, start_new_session=True)
         request = {"operation": "live", "job_id": self.state.job_id, "interval": self.state.interval}
@@ -275,6 +306,80 @@ class SSHSource:
                     stream.close()
                 except OSError:
                     pass
+
+
+class JobDiscovery:
+    def __init__(self, state, host, sources):
+        self.command = ssh_command(host)
+        self.state, self.host, self.sources = state, host, sources
+        self.stopping = threading.Event()
+        self.thread = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _query(self):
+        process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, universal_newlines=True)
+        request = json.dumps({"operation": "jobs", "json": True}) + "\n"
+        deadline = time.monotonic() + DISCOVERY_TIMEOUT
+        try:
+            while not self.stopping.is_set():
+                try:
+                    output, error = process.communicate(input=request, timeout=0.25)
+                    if process.returncode:
+                        raise JobmonError("Queue query exited {}: {}".format(process.returncode, error.strip()[:1000]))
+                    return json.loads(output)
+                except subprocess.TimeoutExpired:
+                    request = None
+                    if time.monotonic() >= deadline:
+                        raise JobmonError("Queue query timed out.")
+            return None
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+
+    def refresh(self):
+        try:
+            result = self._query()
+            if result is None:
+                return
+            if (not isinstance(result, dict) or result.get("schema_version") != SCHEMA_VERSION
+                    or not isinstance(result.get("jobs"), list)):
+                raise JobmonError("Malformed queue response.")
+            ids = []
+            for row in result["jobs"]:
+                if not isinstance(row, dict) or not isinstance(row.get("state"), str):
+                    raise JobmonError("Malformed queue job.")
+                if row["state"] in ("RUNNING", "COMPLETING"):
+                    ids.append(validate_job_id(row.get("job_id")))
+            for job_id in dict.fromkeys(ids):
+                if self.stopping.is_set():
+                    return
+                job = self.state.add_job(job_id)
+                if job is None:
+                    continue
+                source = SSHSource(job, self.host)
+                self.sources.append(source)
+                try:
+                    source.start()
+                except OSError as exc:
+                    job.disconnected("Could not start remote stream: " + str(exc))
+            self.state.set_discovery_error(None)
+        except (OSError, ValueError, JobmonError) as exc:
+            self.state.set_discovery_error("New-job discovery failed; retrying in {} s: {}".format(
+                DISCOVERY_INTERVAL, str(exc)[:1000]))
+
+    def _run(self):
+        while not self.stopping.wait(DISCOVERY_INTERVAL):
+            self.refresh()
+
+    def close(self):
+        self.stopping.set()
+        if self.thread is not None:
+            self.thread.join()
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -397,15 +502,16 @@ def main(argv=None):
     parser.add_argument("--interval", type=int, default=5, help="remote saved-file refresh seconds")
     parser.add_argument("--port", type=int, default=0, help="local port; 0 chooses a free port")
     parser.add_argument("--no-browser", action="store_true", help="print the URL without opening it")
+    parser.add_argument("--follow", action="store_true", help="discover newly running jobs every 30 seconds")
     parser.add_argument("--zip", action="store_true", help="save CPU and memory ZIPs and exit")
     parser.add_argument("--output-dir", default="downloads", help="private ZIP output directory")
     parser.add_argument("--days", type=int, default=30, help="accounting lookback for ZIP export")
     args = parser.parse_args(argv)
-    sources, server = [], None
+    sources, server, discovery = [], None, None
     try:
         if not 1 <= args.interval <= 86400 or not 0 <= args.port <= 65535:
             raise JobmonError("Interval must be 1–86400 seconds and port must be 0–65535.")
-        if not 1 <= args.days <= 3650 or (args.zip and len(args.job_id) != 1):
+        if not 1 <= args.days <= 3650 or (args.zip and (len(args.job_id) != 1 or args.follow)):
             raise JobmonError("ZIP export needs one job ID; days must be 1–3650.")
         state = MultiJobState(args.job_id, args.interval)
         if args.zip:
@@ -429,6 +535,9 @@ def main(argv=None):
                 if len(sources) == 1:
                     raise
                 source.state.disconnected("Could not start remote stream: " + str(exc))
+        if args.follow:
+            discovery = JobDiscovery(state, args.host, sources)
+            discovery.start()
         print("hpc-live: " + server.url, flush=True)
         print("Close the last dashboard browser tab or press Ctrl-C to stop viewing.", flush=True)
         if not args.no_browser:
@@ -444,6 +553,8 @@ def main(argv=None):
         if server is not None:
             server.stopping.set()
             server.server_close()
+        if discovery is not None:
+            discovery.close()
         if sources:
             with ThreadPoolExecutor(max_workers=min(32, len(sources))) as closing:
                 list(closing.map(lambda source: source.close(), sources))

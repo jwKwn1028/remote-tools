@@ -167,6 +167,20 @@ class LiveStateTests(unittest.TestCase):
 
 
 class MultiJobStateTests(unittest.TestCase):
+    def test_new_jobs_notify_without_replacing_saved_history(self):
+        state = live.MultiJobState([JOB_ID], interval=2)
+        for event in events():
+            state.jobs[0].apply(event)
+        before, version = state.snapshot(), state.version
+        added = state.add_job("456_2")
+        self.assertEqual(added.interval, 2)
+        self.assertEqual(state.version, version + 1)
+        self.assertEqual(state.snapshot()["jobs"][0]["runs"], before["runs"])
+        self.assertIsNone(state.add_job("456_2"))
+        with self.assertRaises(JobmonError):
+            state.add_job("../invalid")
+        self.assertEqual(len(state.jobs), 2)
+
     def test_each_job_notifies_the_shared_stream_and_retains_its_own_history(self):
         state = live.MultiJobState([JOB_ID, "456_2"])
         for job in state.jobs:
@@ -404,6 +418,109 @@ class SSHAndShellTests(unittest.TestCase):
                    HPC_JOBMON_HOST="test-alias")
         return env, capture
 
+    def discovery_ssh(self, queue):
+        listing = self.base / "jobs.json"
+        listing.write_text(json.dumps(queue))
+        fixture = self.base / "discovery-events.json"
+        fixture.write_text(json.dumps({job_id: events(job_id=job_id) for job_id in ("456_2", "789")}))
+        capture = self.base / "discovery-requests.jsonl"
+        fake = self.base / "ssh"
+        fake.write_text("#!" + sys.executable + "\nimport json,os,pathlib,sys,time\n"
+                        "request=json.loads(sys.stdin.read())\n"
+                        "with open(os.environ['CAPTURE'],'a') as f: "
+                        "f.write(json.dumps({'request':request,'args':sys.argv[1:],'pid':os.getpid()})+'\\n')\n"
+                        "if request['operation']=='jobs':\n"
+                        " queue=json.loads(pathlib.Path(os.environ['QUEUE']).read_text())\n"
+                        " time.sleep(queue.get('delay',0))\n"
+                        " if queue.get('exit'): sys.stderr.write('synthetic queue failure');sys.exit(queue['exit'])\n"
+                        " print(json.dumps(queue))\n"
+                        "else:\n"
+                        " for event in json.loads(pathlib.Path(os.environ['EVENTS']).read_text())[request['job_id']]:\n"
+                        "  print(json.dumps(event),flush=True)\n"
+                        " time.sleep(60)\n")
+        fake.chmod(0o700)
+        env = dict(PATH=str(self.base) + os.pathsep + os.environ["PATH"],
+                   CAPTURE=str(capture), QUEUE=str(listing), EVENTS=str(fixture))
+        return env, listing, capture
+
+    def test_discovery_adds_newly_running_jobs_once_and_keeps_finished_history(self):
+        env, listing, capture = self.discovery_ssh({"schema_version": 1, "jobs": [
+            {"job_id": JOB_ID, "state": "RUNNING"}, {"job_id": "456_2", "state": "COMPLETING"},
+            {"job_id": "456_2", "state": "COMPLETING"}, {"job_id": "789", "state": "PENDING"}]})
+        state = live.MultiJobState([JOB_ID], interval=2)
+        for event in events():
+            state.jobs[0].apply(event)
+        before = state.jobs[0].snapshot()
+        sources = []
+        discovery = live.JobDiscovery(state, "test-alias", sources)
+        self.addCleanup(lambda: [source.close() for source in sources])
+        with patch.dict(os.environ, env):
+            discovery.refresh()
+            discovery.refresh()
+            self.assertEqual([job.job_id for job in state.jobs], [JOB_ID, "456_2"])
+            self.assertEqual(len(sources), 1)
+            listing.write_text(json.dumps({"schema_version": 1, "jobs": [{"job_id": "789", "state": "RUNNING"}]}))
+            discovery.refresh()
+        deadline = time.monotonic() + 3
+        while any(job.connection != "Live" for job in state.jobs) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(state.jobs[0].snapshot(), before)
+        self.assertEqual([job.job_id for job in state.jobs], [JOB_ID, "456_2", "789"])
+        for job in state.jobs:
+            self.assertEqual(len(job.snapshot()["runs"][0]["nodes"][0]["points"]), 3)
+        requests = [json.loads(line) for line in capture.read_text().splitlines()]
+        self.assertEqual([row["request"] for row in requests if row["request"]["operation"] == "jobs"],
+                         [{"operation": "jobs", "json": True}] * 3)
+        self.assertEqual([row["request"]["job_id"] for row in requests if row["request"]["operation"] == "live"],
+                         ["456_2", "789"])
+        self.assertTrue(all(row["args"][-1] == live.REMOTE_COMMAND for row in requests))
+
+    def test_discovery_validates_all_ids_and_recovers_from_queue_failures(self):
+        state = live.MultiJobState([JOB_ID])
+        discovery = live.JobDiscovery(state, "test-alias", [])
+        for response in ({"schema_version": 1, "jobs": [{"job_id": "456_2", "state": "RUNNING"},
+                                                       {"job_id": "../invalid", "state": "RUNNING"}]},
+                         {"schema_version": 1, "jobs": [None]}, {"jobs": []}, []):
+            with self.subTest(response=response), patch.object(discovery, "_query", return_value=response), \
+                    patch.object(live, "SSHSource") as source:
+                discovery.refresh()
+                self.assertEqual(len(state.jobs), 1)
+                source.assert_not_called()
+                self.assertIn("New-job discovery failed", state.snapshot()["discovery_error"])
+        env, listing, _ = self.discovery_ssh({"exit": 23})
+        with patch.dict(os.environ, env):
+            discovery.refresh()
+            self.assertIn("synthetic queue failure", state.snapshot()["discovery_error"])
+            listing.write_text(json.dumps({"schema_version": 1, "jobs": []}))
+            discovery.refresh()
+        self.assertNotIn("discovery_error", state.snapshot())
+
+    def test_discovery_polls_in_background_and_cancels_a_pending_query_promptly(self):
+        env, _, capture = self.discovery_ssh({"delay": 60})
+        discovery = live.JobDiscovery(live.MultiJobState([JOB_ID]), "test-alias", [])
+        self.addCleanup(discovery.close)
+        with patch.dict(os.environ, env), patch.object(live, "DISCOVERY_INTERVAL", 0.05):
+            discovery.start()
+            deadline = time.monotonic() + 3
+            while not capture.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(capture.exists())
+            started = time.monotonic()
+            discovery.close()
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertFalse(discovery.thread.is_alive())
+        pid = json.loads(capture.read_text().splitlines()[0])["pid"]
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_discovery_times_out_and_retains_existing_jobs(self):
+        env, _, _ = self.discovery_ssh({"delay": 60})
+        state = live.MultiJobState([JOB_ID])
+        with patch.dict(os.environ, env), patch.object(live, "DISCOVERY_TIMEOUT", 0.05):
+            live.JobDiscovery(state, "test-alias", []).refresh()
+        self.assertIn("timed out", state.snapshot()["discovery_error"])
+        self.assertEqual([job.job_id for job in state.jobs], [JOB_ID])
+
     def test_report_zip_shell_downloads_a_complete_snapshot_and_both_charts(self):
         rows = [sample(0), sample(30, 0, memory=None), sample(60, 120)]
         rows[0]["large_counter"] = 2 ** 60 + 1
@@ -557,6 +674,19 @@ class SSHAndShellTests(unittest.TestCase):
             self.assertEqual(snapshots[1]["connection"], "Connecting")
             server.return_value.serve_forever.assert_called_once()
 
+    def test_main_only_discovers_jobs_in_follow_mode_and_closes_discovery(self):
+        for follow in (False, True):
+            with self.subTest(follow=follow), patch.object(live, "DashboardServer"), \
+                    patch.object(live, "SSHSource"), patch.object(live, "JobDiscovery") as discovery, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                args = [JOB_ID, "--host", "test-alias", "--no-browser"] + (["--follow"] if follow else [])
+                self.assertEqual(live.main(args), 0)
+                if follow:
+                    discovery.return_value.start.assert_called_once()
+                    discovery.return_value.close.assert_called_once()
+                else:
+                    discovery.assert_not_called()
+
     def test_without_an_id_collects_all_started_jobs_noninteractively(self):
         script = self.base / "clone/jobmon/live.py"
         script.parent.mkdir(parents=True)
@@ -585,7 +715,8 @@ class SSHAndShellTests(unittest.TestCase):
                 self.assertNotIn("Choose a running job", result.stderr)
                 if ids:
                     self.assertEqual(json.loads(result.stdout),
-                                     ids + ["--host", "test-alias", "--interval", "5", "--port", "0", "--no-browser"])
+                                     ids + ["--host", "test-alias", "--interval", "5", "--port", "0",
+                                            "--no-browser", "--follow"])
                 else:
                     self.assertFalse(result.stdout)
         requests = [json.loads(line) for line in capture.read_text().splitlines()]

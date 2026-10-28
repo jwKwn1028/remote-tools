@@ -271,7 +271,8 @@ Each ZIP contains `chart.svg`, `data.csv`, `data.json` (units/run metadata), and
 `samples.jsonl` when original records are available. Image and data share a
 snapshot, preserve raw integers, and retain missing values as blank/null.
 CLI clock labels use local 24-hour time. Older reporters export CSV/JSON;
-update the reporter for original JSONL. Saved samples are required even when
+update the reporter for original JSONL. ZIP graphs default to time since first
+sample. Saved samples are required even when
 accounting is disabled.
 
 ### Live browser dashboard
@@ -283,15 +284,18 @@ hpc-live 123456 --no-browser     # print the URL
 ```
 
 The local TokyoNight Storm dashboard loads each run from its earliest saved
-sample, then updates in place over one SSH stream per job. Slurm is sampled once
-per job; subsequent refreshes only read files.
+sample, then updates in place over one SSH sample stream per job. Each stream
+reads Slurm once, then refreshes saved files.
 
 Without an ID, current `RUNNING`/`COMPLETING` jobs appear as in-page tabs. Click
 or use focused-tab arrows/Home/End. Tabs preserve run, node, and time-axis choices
-while all jobs update. One job hides the tab bar; rerun to include newly started
-jobs. Completed jobs require an explicit ID.
+while all jobs update. Your queue is checked every 30 seconds; newly running jobs
+appear without a page reload, and finished tabs remain available. Pending jobs
+appear after they start. One job hides the tab bar. An explicit ID monitors only
+that job, including completed jobs.
 
-Choose clock time or time since first sample; hover/tap for values. Toggle the
+The default axis is **Time since first sample**; local date/time is also available.
+Hover/tap for values. Toggle the
 sidebar to hide/restore controls; graphs fill the available width. CPU includes a 100% reference and allows
 higher readings; memory is GiB. **Elapsed** ends at the latest sample and stays
 fixed through gaps; **Monitored** and **Sample span** label fallback start times.

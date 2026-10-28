@@ -273,7 +273,8 @@ for(const id of ["data","run","node","axis","title","runtime","connection","cont
  const item=new Element(["run","node","axis"].includes(id)?"select":"div");item.id=id;
 }
 elements.sidebar.parentElement=new Element("main");elements.axis.value="clock";
-const initial=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));elements.data.textContent=JSON.stringify(initial);
+const initial=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+elements.data.textContent=JSON.stringify(initial.jobs[0]);
 const saves=["cpu","memory"].map(id=>({dataset:{save:id}}));
 const document={getElementById:id=>elements[id],createElement:tag=>new Element(tag),
  createElementNS:(_ns,tag)=>new Element(tag),querySelectorAll:()=>saves,
@@ -283,20 +284,26 @@ const context={document,window:{addEventListener:(type,callback)=>listeners[type
  XMLSerializer:class{serializeToString(){return "<svg/>";}},TextEncoder,Uint8Array,DataView,Blob};
 vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[2],"utf8"),context);
 const click=id=>elements["job-tab-"+id].onclick();
+assert.equal(elements["job-tabs"].hidden,true);assert.equal(elements.axis.value,"elapsed");
+elements.axis.value="clock";elements.axis.onchange();
+const originalPath=elements.cpu.children.find(child=>child.tag==="path");
+connections[0].onmessage({data:JSON.stringify(initial)});
+assert.equal(elements.axis.value,"clock","new jobs preserve the selected axis");
+assert.equal(elements.cpu.children.find(child=>child.tag==="path"),originalPath);
 assert.equal(connections.length,1);assert.equal(elements["job-tabs"].hidden,false);
 assert.equal(elements["job-tabs"].children.length,2);
 assert.equal(elements.completion.hidden,true);
 elements.run.value="0";elements.run.onchange();elements.node.value="1";elements.node.onchange();
-elements.axis.value="elapsed";elements.axis.onchange();elements["sidebar-toggle"].onclick();
+elements["sidebar-toggle"].onclick();
 click("456_2");assert.match(document.title,/456_2 \(second simulation α\)/);
-assert.equal(elements.axis.value,"clock");assert.equal(elements.diagnostics.textContent,"second job diagnostic");
+assert.equal(elements.axis.value,"elapsed");assert.equal(elements.diagnostics.textContent,"second job diagnostic");
 const path=elements.cpu.children.find(child=>child.tag==="path");
 const next=JSON.parse(JSON.stringify(initial));next.jobs[0].version++;
 next.jobs[0].runs[0].runtime.display="2:40:40";
 connections[0].onmessage({data:JSON.stringify(next)});
 assert.equal(elements.cpu.children.find(child=>child.tag==="path"),path,"background updates preserve the active chart");
 click(initial.jobs[0].job_id);
-assert.equal(elements.run.value,0);assert.equal(elements.node.value,1);assert.equal(elements.axis.value,"elapsed");
+assert.equal(elements.run.value,0);assert.equal(elements.node.value,1);assert.equal(elements.axis.value,"clock");
 assert.equal(elements.runtime.textContent,"Elapsed 2:40:40");assert.equal(elements.sidebar.hidden,true);
 const exported=JSON.parse(context.exportFiles("cpu").files.find(([name])=>name==="data.json")[1]);
 assert.equal(exported.job_id,initial.jobs[0].job_id);assert.equal(exported.node,"node2");
@@ -310,6 +317,11 @@ assert.equal(Number(elements.run.value),1,"second job keeps its latest run");
 assert.equal(Number(elements.node.value),0,"second job keeps its own node");
 const other=JSON.parse(context.exportFiles("memory").files.find(([name])=>name==="data.json")[1]);
 assert.equal(other.job_id,"456_2");assert.equal(elements.diagnostics.textContent,"second job diagnostic");
+next.discovery_error="New-job discovery failed; retrying";
+connections[0].onmessage({data:JSON.stringify(next)});
+assert.match(elements.diagnostics.textContent,/New-job discovery failed/);
+delete next.discovery_error;connections[0].onmessage({data:JSON.stringify(next)});
+assert.equal(elements.diagnostics.textContent,"second job diagnostic");
 // A quiet/disconnected stream and final samples alone are not completion.
 next.jobs[1].version++;next.jobs[1].connection="Remote stream ended";
 next.jobs[1].runs[1].nodes[0].points.at(-1).final=true;
@@ -512,6 +524,7 @@ Promise.all(downloads.map(async result=>({filename:result.filename,
                 self.assertTrue(all(info.external_attr >> 16 & 0o777 == 0o600 for info in bundle.infolist()))
                 saved = json.loads(bundle.read("data.json"))
                 self.assertEqual(saved["job_id"], JOB_ID)
+                self.assertEqual(saved["time_axis"], "elapsed")
                 self.assertTrue(saved["raw_samples_complete"])
                 self.assertIn("-" + saved["node"] + "-" + saved["chart"] + "-", path.name)
                 original = [json.loads(line) for line in bundle.read("samples.jsonl").splitlines()]

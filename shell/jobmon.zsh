@@ -257,7 +257,7 @@ hpc-live() {
     case $1 in
       -h|--help)
         print -r -- 'Usage: hpc-live [JOB_ID] [--interval SECONDS] [--port PORT] [--no-browser]'
-        print -r -- 'Without an ID, opens all running jobs as tabs in one local browser dashboard.'
+        print -r -- 'Without an ID, opens running jobs as tabs and adds newly running jobs every 30 seconds.'
         return 0
         ;;
       --interval|--port)
@@ -293,6 +293,7 @@ hpc-live() {
     return 2
   fi
   if [[ -z $job_id ]]; then
+    options+=(--follow)
     local output line
     local -i others=0
     output=$(_jobmon_request jobs) || return
