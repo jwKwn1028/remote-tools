@@ -5,24 +5,28 @@ import argparse
 import bisect
 from contextlib import ExitStack
 import datetime as dt
+import fcntl
 import heapq
 import json
 import math
 import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import tarfile
 import time
+import uuid
 
 from collect import (PROCESS_TREE_SCOPE, SCHEMA_VERSION, data_root, initialize_storage_probe, load_run,
-                     private_directory, private_open, read_json, utc_now,
-                     verify_storage_probe)
+                     monitoring_active, private_directory, private_open, read_json, utc_now, verify_storage_probe)
 from slurm_backend import (JobmonError, SlurmBackend, accounting_disabled, cpu_seconds, number,
                            validate_job_id)
 
 MAX_LINE = 1024 * 1024
 # Bound a fast node's pending readings while another node's file is delayed.
 MEMORY_ALIGNMENT_BUFFER_SAMPLES = 128
+ATTACH_START_TIMEOUT = 45
 # Scopes that carry per-node memory readings, with the wording each one earns.
 MEMORY_SCOPE_NOTES = {
     "job_cgroup_v2": "job cgroup charges including cache; not process RSS; independent peaks are not concurrent",
@@ -940,6 +944,110 @@ def export_history(job_id):
                     archive.addfile(info, stream.buffer)
 
 
+def attachable_jobs(backend=None):
+    rows = (backend or SlurmBackend()).jobs()
+    result = []
+    for row in rows:
+        if row["state"] != "RUNNING" or row["nodes"] != "1":
+            continue
+        validate_job_id(row["job_id"])
+        if not monitoring_active(row["job_id"]):
+            result.append(row)
+    return result
+
+
+def attachment_error(message, log):
+    try:
+        with private_open(log, os.O_RDONLY) as stream:
+            stream.buffer.seek(0, os.SEEK_END)
+            stream.buffer.seek(max(0, stream.buffer.tell() - 4096))
+            tail = stream.buffer.read(4096).decode("utf-8", errors="replace").strip()
+        detail = "\n" + "\n".join(display_job_name(line) for line in tail.splitlines()) if tail else ""
+    except (OSError, JobmonError):
+        detail = "\nStartup log could not be read."
+    return JobmonError("{}; log: {}{}".format(message, log, detail))
+
+
+def attach_job(job_id, interval=60, backend=None):
+    validate_job_id(job_id)
+    if type(interval) is not int or not 1 <= interval <= 86400:
+        raise JobmonError("Attachment interval must be 1–86400 seconds.")
+    backend = backend or SlurmBackend()
+    rows = backend.jobs(job_id)
+    if (len(rows) != 1 or rows[0]["job_id"] != job_id or rows[0]["state"] != "RUNNING"
+            or rows[0]["nodes"] != "1"):
+        raise JobmonError("Attachment needs one of your running, single-node batch jobs.")
+    row = rows[0]
+    if not str(row["cpus"]).isdigit() or int(row["cpus"]) < 1:
+        raise JobmonError("Cannot verify the job's allocated CPU count.")
+    root = private_directory(data_root())
+    verify_storage_probe(root)
+    directory = private_directory(root / job_id, create=True)
+    with private_open(directory / ".attach.lock", os.O_RDWR | os.O_CREAT, "r+") as reservation:
+        try:
+            fcntl.flock(reservation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise JobmonError("Monitoring is already active or being attached to job " + job_id) from exc
+        if monitoring_active(job_id, include_reservation=False):
+            raise JobmonError("Monitoring is already active for job " + job_id)
+        raw = backend.allocation_id(job_id)
+        overlap = backend.step_overlap_options()
+        run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-attach-" + uuid.uuid4().hex[:12]
+        log = directory / (run_id + ".log")
+        request = {"job_id": job_id, "job_id_raw": raw, "run_id": run_id, "job_name": row.get("job_name"),
+                   "cpus": int(row["cpus"]), "interval": interval}
+        payload = json.dumps(request) + "\n"
+        if len(payload) > 8192:
+            raise JobmonError("Attachment request exceeds 8192 bytes.")
+        command = ["srun", "--jobid=" + raw] + overlap + ["--nodes=1", "--ntasks=1", "--cpus-per-task=1",
+                   "--mem=64M", "--gres=none", "--export=ALL", "--kill-on-bad-exit=0", "--immediate=10",
+                   os.environ.get("JOBMON_PYTHON") or sys.executable,
+                   str(Path(__file__).resolve().with_name("collect.py")), "_attach"]
+        with private_open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "w") as output:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=output,
+                                       universal_newlines=True, start_new_session=True)
+        ready = False
+        try:
+            process.stdin.write(payload)
+            process.stdin.close()
+            deadline = time.monotonic() + ATTACH_START_TIMEOUT
+            run = directory / run_id
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise attachment_error("Attached collector exited before startup (exit {})".format(
+                        process.returncode), log)
+                if run.exists():
+                    private_directory(run)
+                    for path in run.glob("*.ready.json"):
+                        try:
+                            read_json(path)
+                        except (FileNotFoundError, ValueError):
+                            continue
+                        load_run(run)
+                        ready = True
+                    if ready:
+                        print("Monitoring attached to job {} ({}), every {} s.\n"
+                              "Collection continues after this command returns; use hpc-live or hpc-jwatch {}.\n"
+                              "Earlier samples and the workload exit code are unavailable.".format(
+                                  job_id, display_job_name(row.get("job_name")), interval, job_id), flush=True)
+                        return
+                time.sleep(0.1)
+            raise attachment_error("Timed out starting the attached collector", log)
+        finally:
+            if not process.stdin.closed:
+                process.stdin.close()
+            if not ready:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+
+
 def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=30,
             utc_offset_minutes=None, exit_on_completion=False):
     if operation == "storage-init":
@@ -984,8 +1092,8 @@ def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=
             result["cgroup"] = {"path": str(cgroup) if cgroup else None, "reason": reason}
         emit(result, as_json)
         return
-    if operation == "jobs":
-        rows = SlurmBackend().jobs()
+    if operation in ("jobs", "attach-jobs"):
+        rows = attachable_jobs() if operation == "attach-jobs" else SlurmBackend().jobs()
         if as_json:
             emit({"schema_version": SCHEMA_VERSION, "jobs": rows}, True)
         else:
@@ -995,6 +1103,9 @@ def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=
                       + "\t" + display_job_name(row.get("job_name")))
         return
     validate_job_id(job_id)
+    if operation == "attach":
+        attach_job(job_id, interval)
+        return
     if operation == "fetch":
         export_history(job_id)
         return
@@ -1049,6 +1160,8 @@ def transport_request(stream):
         "doctor": {"operation", "json"},
         "storage-init": {"operation", "json"},
         "jobs": {"operation", "json"},
+        "attach-jobs": {"operation", "json"},
+        "attach": {"operation", "job_id", "interval"},
         "show": {"operation", "job_id", "json", "days"},
         "watch": {"operation", "job_id", "json", "days", "interval", "count", "utc_offset_minutes",
                   "exit_on_completion"},
@@ -1061,7 +1174,7 @@ def transport_request(stream):
     unsupported = set(request) - allowed[operation]
     if unsupported:
         raise JobmonError("Unsupported fields for {}: {}.".format(operation, ", ".join(sorted(unsupported))))
-    if operation in ("show", "watch", "report", "fetch", "live"):
+    if operation in ("show", "watch", "report", "fetch", "live", "attach"):
         validate_job_id(request.get("job_id"))
     for name in ("json", "exit_on_completion"):
         if name in request and not isinstance(request[name], bool):
@@ -1071,6 +1184,8 @@ def transport_request(stream):
         if name in request and (type(request[name]) is not int or not low <= request[name] <= high):
             raise JobmonError("{} must be an integer between {} and {}.".format(name, low, high))
     request["as_json"] = request.pop("json", False)
+    if operation == "attach":
+        request.setdefault("interval", 60)
     return request
 
 
@@ -1078,12 +1193,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="operation", required=True)
     subs.add_parser("_transport", help="private JSON-over-SSH entry point")
-    for name in ("doctor", "storage-init", "jobs", "show", "watch", "report", "live"):
+    for name in ("doctor", "storage-init", "jobs", "show", "watch", "report", "live", "attach-jobs", "attach"):
         command = subs.add_parser(name)
-        command.add_argument("--json", dest="as_json", action="store_true")
-        if name in ("show", "watch", "report", "live"):
+        if name != "attach":
+            command.add_argument("--json", dest="as_json", action="store_true")
+        if name in ("show", "watch", "report", "live", "attach"):
             command.add_argument("job_id")
-            command.add_argument("--days", type=int, default=30)
+            if name != "attach":
+                command.add_argument("--days", type=int, default=30)
+        if name == "attach":
+            command.add_argument("--interval", type=int, default=60)
         if name in ("watch", "live"):
             command.add_argument("--interval", type=int, default=5)
             command.add_argument("--count", type=int, help="stop after this many snapshots")

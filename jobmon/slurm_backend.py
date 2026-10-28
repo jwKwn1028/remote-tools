@@ -208,6 +208,32 @@ class SlurmBackend:
                 raise JobmonError(ACCOUNTING_DISABLED_GUIDANCE) from exc
             raise
 
+    def allocation_id(self, job_id):
+        job_id = validate_job_id(job_id)
+        if "_" not in job_id:
+            return job_id
+        rows = parse_rows(self.run(["squeue", "--local", "--array", "--noheader", "--user=" + self.user,
+                                    "--jobs=" + job_id, "--format=%A|%i|%u"]),
+                          ("job_id_raw", "job_id", "user"))
+        matches = [row for row in rows if row["job_id"] == job_id and row["user"] == self.user]
+        if len(matches) != 1:
+            raise JobmonError("Cannot resolve one owned allocation for array task " + job_id)
+        raw = validate_job_id(matches[0]["job_id_raw"])
+        if "_" in raw:
+            raise JobmonError("squeue did not return a numeric allocation ID for " + job_id)
+        return raw
+
+    def step_overlap_options(self):
+        help_text = self.run(["srun", "--help"])
+        if "--overlap" in help_text:
+            return ["--overlap"]
+        version = self.run(["srun", "--version"])
+        match = re.search(r"\bslurm(?:-wlm)?\s+([0-9]+)\.([0-9]+)", version, re.I)
+        # Before 20.11, steps shared allocation resources by default.
+        if match and tuple(map(int, match.groups())) < (20, 11):
+            return []
+        raise JobmonError("srun lacks --overlap and its legacy step-sharing behavior cannot be verified.")
+
     def _accounting(self, job_id, days):
         supported = self.fields("sacct")
         if not {"JobID", "JobIDRaw", "User", "UID"}.issubset(supported):

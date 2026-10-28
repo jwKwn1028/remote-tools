@@ -16,8 +16,8 @@ configuration, limitations, and daily usage.
   and saved-history aggregation.
 - `jobmon/slurm_backend.py`: validated job identities, bounded Slurm commands,
   and scheduler output parsing/normalization.
-- `jobmon/collect.py`: allocation-local cgroup/GPU sampling and private history
-  storage. It does not poll the scheduler.
+- `jobmon/collect.py`: allocation-local sampling, batch-process attachment, and
+  private history storage. It does not poll the scheduler.
 - `jobmon/plot.py`: workstation-only archive reader and standalone HTML/SVG time
   plots and dashboard-format ZIP exports; reuses report validation and CPU
   calculations, never extracts archives.
@@ -25,13 +25,13 @@ configuration, limitations, and daily usage.
   also reads one-shot snapshots for ZIP exports. Uses the plot renderer and
   shuts down after the last browser tab closes.
 - `shell/jobmon.zsh`: workstation commands such as `hpc-jobs`, `hpc-jreport`,
-  `hpc-jfetch`, `hpc-live`, and `hpc-jdeploy`.
+  `hpc-jattach`, `hpc-jfetch`, `hpc-live`, and `hpc-jdeploy`.
 - `shell/deploy-jobmon.sh`: explicit, checksum-verified, content-addressed remote
   deployment of the three Python source files and `examples/monitored-job.sh`,
   with a stable wrapper symlink under `~/.local/bin`. `--local` runs the identical
   install script in the current account, for clusters without workstation SSH.
 - `examples/`: remote environment and bashrc fragments, plus the deployed batch
-  wrapper (collection remains opt-in through the submitted job script).
+  wrapper. Collection requires the wrapper or explicit attachment.
 - `tests/`: synthetic unit, transport, wrapper, deployment, compatibility, and
   publication safety tests. Tests must not require a live cluster.
 - `.github/workflows/checks.yml`: the validation commands below, run on push and

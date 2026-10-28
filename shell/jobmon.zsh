@@ -28,10 +28,10 @@ _jobmon_ssh() {
 
 _jobmon_request() {
   emulate -L zsh
-  local operation=$1 job_id='' request option value
+  local operation=$1 job_id='' request option value sampling_interval=60
   shift
   case $operation in
-    show|watch|report|fetch)
+    show|watch|report|fetch|attach)
       job_id=${1:-}
       local job_pattern='^[1-9][0-9]*(_[0-9]+)?$'
       if [[ ! $job_id =~ $job_pattern || ${#job_id} -gt 40 ]]; then
@@ -41,14 +41,17 @@ _jobmon_request() {
       shift
       request='{"operation":"'${operation}'","job_id":"'${job_id}'"'
       ;;
-    jobs|doctor|storage-init) request='{"operation":"'${operation}'"' ;;
+    jobs|doctor|storage-init|attach-jobs) request='{"operation":"'${operation}'"' ;;
     *) print -u2 -- 'jobmon: unsupported operation'; return 2 ;;
   esac
   while (( $# )); do
     option=$1
     shift
     case $option in
-      --json) request+=',"json":true' ;;
+      --json)
+        [[ $operation == attach ]] && { print -u2 -- 'jobmon: --json is not valid for attach.'; return 2; }
+        request+=',"json":true'
+        ;;
       --exit-on-completion)
         if [[ $operation != watch ]]; then
           print -u2 -- "jobmon: $option is not valid for $operation."
@@ -58,7 +61,7 @@ _jobmon_request() {
         ;;
       --days|--interval|--count)
         if [[ $option == --days && $operation != (show|watch|report) ]] ||
-           [[ $option != --days && $operation != watch ]]; then
+           [[ $option != --days && $operation != watch && ! ( $operation == attach && $option == --interval ) ]]; then
           print -u2 -- "jobmon: $option is not valid for $operation."
           return 2
         fi
@@ -72,11 +75,16 @@ _jobmon_request() {
           return 2
         fi
         shift
-        request+=',"'${option#--}'":'${value}
+        if [[ $operation == attach ]]; then
+          sampling_interval=$value
+        else
+          request+=',"'${option#--}'":'${value}
+        fi
         ;;
       *) print -u2 -- "jobmon: unsupported option: $option"; return 2 ;;
     esac
   done
+  [[ $operation == attach ]] && request+=',"interval":'$sampling_interval
   if [[ $operation == watch ]]; then
     # Display watch times in the workstation's UTC offset.
     local zone=${(%):-%D{%z}}
@@ -91,7 +99,8 @@ _jobmon_request() {
 # Return the selected running job in REPLY; use /dev/tty to keep stdout clean.
 _jobmon_choose_job() {
   emulate -L zsh
-  local action=${1:-watch}
+  local action=${1:-watch} operation=jobs
+  [[ $action == attach ]] && operation=attach-jobs
   local job_pattern='^[1-9][0-9]*(_[0-9]+)?$' output line key rest frame terminal=
   local -a fields ids rows
   local -i others=0 count selected=1 top=1 visible drawn=0 i width
@@ -99,7 +108,7 @@ _jobmon_choose_job() {
     print -u2 -- 'jobmon: expected a job ID such as 123456 or 123456_7.'
     return 2
   fi
-  output=$(_jobmon_request jobs) || return
+  output=$(_jobmon_request "$operation") || return
   for line in ${(f)output}; do
     fields=("${(@ps:\t:)line}")
     [[ $fields[1] == 'JOB ID' ]] && continue
@@ -117,7 +126,11 @@ _jobmon_choose_job() {
     if (( others )); then
       print -u2 -- "jobmon: no running jobs to $action ($others queued or not running)."
     else
-      print -u2 -- "jobmon: no running jobs to $action."
+      if [[ $action == attach ]]; then
+        print -u2 -- 'jobmon: no unmonitored running single-node jobs to attach.'
+      else
+        print -u2 -- "jobmon: no running jobs to $action."
+      fi
     fi
     return 1
   fi
@@ -154,8 +167,8 @@ _jobmon_choose_job() {
       drawn=$(( visible + 3 ))
       read -sk 1 key || return 130
       case $key in
-        j) (( selected < count )) && (( ++selected )) ;;
-        k) (( selected > 1 )) && (( --selected )) ;;
+        j|J) (( selected < count )) && (( ++selected )) ;;
+        k|K) (( selected > 1 )) && (( --selected )) ;;
         $'\e')
           # An arrow key is Esc plus two bytes; Esc alone cancels.
           rest=''
@@ -192,6 +205,81 @@ hpc-jwatch() {
     set -- "$REPLY" "$@"
   fi
   _jobmon_request watch "$@"
+}
+hpc-jattach() {
+  emulate -L zsh
+  local job_id='' interval=60 option value REPLY
+  local -i all=0 result=0 attached=0 interrupted=0
+  local job_pattern='^[1-9][0-9]*(_[0-9]+)?$' integer_pattern='^[1-9][0-9]{0,6}$'
+  while (( $# )); do
+    option=$1
+    shift
+    case $option in
+      -h|--help)
+        print -r -- 'Usage: hpc-jattach [JOB_ID | -a] [--interval SECONDS]'
+        print -r -- 'Choose one unmonitored job, or attach all with -a. Save every 60 s; check the batch process every 5 s.'
+        return 0
+        ;;
+      -a|--all) all=1 ;;
+      --interval)
+        value=${1:-}
+        if [[ ! $value =~ $integer_pattern || $value -gt 86400 ]]; then
+          print -u2 -- 'jobmon: invalid positive integer for --interval.'
+          return 2
+        fi
+        interval=$value
+        shift
+        ;;
+      *)
+        if [[ -n $job_id || ! $option =~ $job_pattern || ${#option} -gt 40 ]]; then
+          print -u2 -- 'Usage: hpc-jattach [JOB_ID | -a] [--interval SECONDS]'
+          return 2
+        fi
+        job_id=$option
+        ;;
+    esac
+  done
+  if (( all )); then
+    if [[ -n $job_id ]]; then
+      print -u2 -- 'jobmon: choose a job ID or -a, not both.'
+      return 2
+    fi
+    local output line
+    local -a fields
+    local -aU ids
+    output=$(_jobmon_request attach-jobs) || return
+    for line in ${(f)output}; do
+      fields=("${(@ps:\t:)line}")
+      [[ $fields[1] == 'JOB ID' ]] && continue
+      if [[ ! $fields[1] =~ $job_pattern || ${#fields[1]} -gt 40 ]]; then
+        print -u2 -- 'jobmon: invalid job ID in the attachment candidates response.'
+        return 2
+      fi
+      ids+=("$fields[1]")
+    done
+    if (( ! ${#ids} )); then
+      print -r -- 'jobmon: no unmonitored running single-node jobs to attach.'
+      return 0
+    fi
+    TRAPINT() { interrupted=1; return 130; }
+    for job_id in "${ids[@]}"; do
+      if _jobmon_request attach "$job_id" --interval "$interval"; then
+        (( ++attached ))
+      else
+        (( interrupted || $? == 130 )) && return 130
+        print -u2 -- "jobmon: could not attach job $job_id."
+        result=1
+      fi
+      (( interrupted )) && return 130
+    done
+    print -r -- "Attached $attached of ${#ids} eligible jobs."
+    return $result
+  fi
+  if [[ -z $job_id ]]; then
+    _jobmon_choose_job attach || return
+    job_id=$REPLY
+  fi
+  _jobmon_request attach "$job_id" --interval "$interval"
 }
 hpc-jreport() {
   emulate -L zsh

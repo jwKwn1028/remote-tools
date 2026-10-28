@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import fcntl
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -157,12 +158,12 @@ def expand_cpu_counts(value):
     return counts
 
 
-def initialize(root=None, runner=run_command):
+def initialize(root=None, runner=run_command, run_id=None, attachment=None):
     job_id, raw = allocation_job_id()
     root = private_directory(root or data_root(), create=True)
     probe = verify_storage_probe(root)
     job_dir = private_directory(root / job_id, create=True)
-    run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-r{}-{}".format(
+    run_id = run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-r{}-{}".format(
         os.environ.get("SLURM_RESTART_COUNT", "0"), uuid.uuid4().hex[:12])
     checked_name(run_id)
     run_dir = private_directory(job_dir / run_id, create=True)
@@ -195,8 +196,12 @@ def initialize(root=None, runner=run_command):
     elif cpus:
         errors.append("SLURM_JOB_CPUS_PER_NODE does not give every allocation node at least one CPU; "
                       "per-node CPU denominators are unavailable.")
+    if attachment is not None:
+        nodes, count = [checked_name(attachment["node"])], 1
+        cpu_map = {nodes[0]: attachment["cpus"]}
+        errors.append("Monitoring attached after job start; earlier samples and workload exit are unavailable.")
     metadata = {"schema_version": SCHEMA_VERSION, "job_id": job_id, "job_id_raw": raw,
-                "job_name": os.environ.get("SLURM_JOB_NAME") or None,
+                "job_name": attachment["job_name"] if attachment else os.environ.get("SLURM_JOB_NAME") or None,
                 "run_id": run_id, "uid": os.getuid(), "user": identity(), "created_at": utc_now(),
                 "restart_count": os.environ.get("SLURM_RESTART_COUNT", "0"),
                 "cluster": os.environ.get("SLURM_CLUSTER_NAME"), "expected_nodes": nodes,
@@ -204,6 +209,8 @@ def initialize(root=None, runner=run_command):
                 "allocated_cpus_by_node": cpu_map, "errors": errors,
                 "storage_visibility": "login-created probe verified from allocation node",
                 "storage_probe": probe}
+    if attachment is not None:
+        metadata["attachment"] = attachment
     write_json(run_dir / "metadata.json", metadata)
     return run_dir
 
@@ -238,6 +245,123 @@ def load_run(run_dir, root=None, job_id=None):
     if any(type(value) is not int or value < 1 for value in cpus.values()):
         raise JobmonError("Invalid per-node CPU allocation metadata.")
     return metadata
+
+
+def monitoring_active(job_id, root=None, include_reservation=True):
+    job_id = validate_job_id(job_id)
+    root = Path(root or data_root())
+    if not root.exists():
+        return False
+    private_directory(root)
+    directory = root / job_id
+    if not directory.exists():
+        return False
+    private_directory(directory)
+    locks = list(directory.glob("*.collector.lock"))
+    if include_reservation and (directory / ".attach.lock").exists():
+        locks.append(directory / ".attach.lock")
+    for path in locks:
+        with private_open(path, os.O_RDONLY) as stream:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+    for run in directory.iterdir():
+        if run.is_dir():
+            metadata = load_run(run, root, job_id)
+            for path in run.glob("*.lock"):
+                with private_open(path, os.O_RDONLY) as stream:
+                    try:
+                        fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return True
+            if recent_samples(run, metadata):
+                return True
+    return False
+
+
+def recent_samples(run, metadata, now=None):
+    """Also detect collectors when advisory locks are not visible across hosts."""
+    now = time.time() if now is None else now
+    for path in run.glob("*.jsonl"):
+        with private_open(path, os.O_RDONLY) as stream:
+            stream.buffer.seek(0, os.SEEK_END)
+            size = stream.buffer.tell()
+            start = max(0, size - 2 * 1024 * 1024)
+            stream.buffer.seek(start)
+            content = stream.buffer.read(2 * 1024 * 1024)
+        lines = content.split(b"\n")
+        if start:
+            lines = lines[1:]
+        complete = [line for line in lines[:-1] if line.strip()]
+        if not complete or len(complete[-1]) > 1024 * 1024:
+            continue
+        try:
+            record = json.loads(complete[-1])
+            if (not isinstance(record, dict) or record.get("schema_version") != SCHEMA_VERSION
+                    or record.get("job_id") != metadata["job_id"]
+                    or record.get("job_id_raw") != metadata["job_id_raw"]
+                    or record.get("run_id") != metadata["run_id"] or record.get("stream_id") != path.stem
+                    or record.get("final") is not False):
+                continue
+            node = checked_name(record.get("node"))
+            if (not path.stem.startswith(node + "--")
+                    or metadata["expected_nodes"] and node not in metadata["expected_nodes"]):
+                continue
+            interval = record.get("interval_seconds")
+            if type(interval) not in (int, float) or not math.isfinite(interval) or not 1 <= interval <= 86400:
+                continue
+            stamp = dt.datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00"))
+            if stamp.tzinfo is not None and -60 <= now - stamp.timestamp() <= max(2.5 * interval, interval + 30):
+                return True
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError, JobmonError):
+            continue
+    return False
+
+
+class BatchProcess:
+    def __init__(self, pid, proc=Path("/proc")):
+        self.pid, self.proc = pid, proc
+        self.group, self.started = self._identity()
+
+    def _identity(self):
+        path = self.proc / str(self.pid)
+        if path.stat().st_uid != os.getuid():
+            raise JobmonError("Batch process is not owned by you.")
+        content = (path / "stat").read_text()
+        fields = content[content.rindex(")") + 2:].split()
+        if fields[0] in ("Z", "X") or int(content.split("(", 1)[0]) != self.pid:
+            raise JobmonError("Batch process has exited.")
+        return int(fields[2]), int(fields[19])
+
+    def alive(self):
+        try:
+            return self._identity() == (self.group, self.started)
+        except (OSError, ValueError, IndexError, JobmonError):
+            return False
+
+
+def batch_process(job_id, raw, runner=run_command, proc=Path("/proc")):
+    validate_job_id(job_id)
+    validate_job_id(raw)
+    output = runner(["scontrol", "listpids", raw + ".batch"])
+    pids = set()
+    for line in output.splitlines():
+        fields = line.split()
+        if (len(fields) == 5 and fields[0].isdigit() and fields[1] == raw and fields[2] == "batch"
+                and fields[3:] == ["0", "0"]):
+            pids.add(int(fields[0]))
+    if len(pids) != 1:
+        raise JobmonError("Cannot identify one batch task with scontrol listpids; attachment refused.")
+    target = BatchProcess(pids.pop(), proc)
+    with (proc / str(target.pid) / "environ").open("rb") as stream:
+        content = stream.read(1024 * 1024 + 1)
+    if len(content) > 1024 * 1024:
+        raise JobmonError("Batch environment is too large to verify.")
+    env = dict(item.decode(errors="surrogateescape").split("=", 1) for item in content.split(b"\0") if b"=" in item)
+    if allocation_job_id(env) != (job_id, raw) or not target.alive() or target.group <= 1:
+        raise JobmonError("Batch process identity does not match this allocation.")
+    return target
 
 
 def unescape_mount(value):
@@ -492,18 +616,21 @@ def stop_requested(run_dir, stop):
     return False
 
 
-def wait_for_next_sample(run_dir, stop, deadline, poll=STOP_POLL_SECONDS):
+def wait_for_next_sample(run_dir, stop, deadline, poll=STOP_POLL_SECONDS, target=None):
     """Wait responsively so a stop marker still produces one final sample.
 
     Signals set the event directly, so only the shared-storage marker is polled;
     a short interval still bounds each wait by its own remaining time.
     """
     while time.monotonic() < deadline and not stop.is_set():
+        if target is not None and not target.alive():
+            stop.set()
+            break
         stop.wait(min(poll, max(0, deadline - time.monotonic())))
         stop_requested(run_dir, stop)
 
 
-def collect(run_dir, interval=60, once=False, stop=None):
+def collect(run_dir, interval=60, once=False, stop=None, target=None):
     if not 1 <= interval <= 86400:
         raise JobmonError("Collection interval must be between 1 and 86400 seconds.")
     metadata = load_run(run_dir)
@@ -519,13 +646,18 @@ def collect(run_dir, interval=60, once=False, stop=None):
     process_group = None
     if not cgroup:
         process_group, group_error = discover_process_group()
+        if target is not None and os.environ.get("JOBMON_PROCESS_TREE") == "1":
+            process_group, group_error = target.group, None
         if process_group is None:
             cgroup_error = "; ".join(part for part in (cgroup_error, group_error) if part)
-    gpu = NvidiaSampler()
+    gpu = NvidiaSampler(env={} if target is not None else None)
     cpus = metadata["allocated_cpus_by_node"].get(node)
-    lock = private_open(run_dir / (node + ".lock"), os.O_RDWR | os.O_CREAT, "r+")
+    job_lock = private_open(run_dir.parent / (node + ".collector.lock"), os.O_RDWR | os.O_CREAT, "r+")
+    lock = None
     try:
         try:
+            fcntl.flock(job_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock = private_open(run_dir / (node + ".lock"), os.O_RDWR | os.O_CREAT, "r+")
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise JobmonError("A collector is already running on node " + node) from exc
@@ -537,7 +669,12 @@ def collect(run_dir, interval=60, once=False, stop=None):
                 tick = time.monotonic()
                 # CPU/memory alignment uses capture time, before a possibly slow GPU query.
                 timestamp = utc_now()
-                metrics = sample_metrics(cgroup, cgroup_error, cpus, previous, tick, process_group)
+                if target is not None and not target.alive():
+                    stop.set()
+                    metrics = sample_metrics(None, "Original batch process exited; attached collection stopped.",
+                                             cpus, previous, tick)
+                else:
+                    metrics = sample_metrics(cgroup, cgroup_error, cpus, previous, tick, process_group)
                 gpus, gpu_errors = gpu.sample()
                 record = sample_record(metadata, job_id, raw, node, stream_id, interval,
                                        tick, timestamp, metrics, gpus, gpu_errors, stop.is_set() or once)
@@ -551,9 +688,49 @@ def collect(run_dir, interval=60, once=False, stop=None):
                 if stop_requested(run_dir, stop):
                     continue
                 # Check the stop marker promptly without collecting or calling Slurm.
-                wait_for_next_sample(run_dir, stop, tick + interval)
+                if target is None:
+                    wait_for_next_sample(run_dir, stop, tick + interval)
+                else:
+                    wait_for_next_sample(run_dir, stop, tick + interval, target=target)
     finally:
-        lock.close()
+        if lock is not None:
+            lock.close()
+        job_lock.close()
+
+
+def attach_collect(request, stop):
+    fields = {"job_id", "job_id_raw", "run_id", "job_name", "cpus", "interval"}
+    if not isinstance(request, dict) or set(request) != fields:
+        raise JobmonError("Attachment expects job_id, job_id_raw, run_id, job_name, cpus, and interval only.")
+    job_id = validate_job_id(request.get("job_id"))
+    expected_raw = validate_job_id(request.get("job_id_raw"))
+    current, raw = allocation_job_id()
+    if raw != expected_raw or current not in (job_id, raw) or "_" not in job_id and job_id != raw:
+        raise JobmonError("Attachment allocation does not match the requested job.")
+    run_id = checked_name(request.get("run_id"))
+    cpus, interval = request.get("cpus"), request.get("interval")
+    if (type(cpus) is not int or cpus < 1 or type(interval) is not int or not 1 <= interval <= 86400
+            or not isinstance(request.get("job_name"), (str, type(None)))):
+        raise JobmonError("Invalid attachment allocation or interval.")
+    if os.environ.get("SLURM_JOB_NUM_NODES", os.environ.get("SLURM_NNODES", "")) != "1":
+        raise JobmonError("Attachment currently supports single-node batch jobs only.")
+    target = batch_process(job_id, raw)
+    # Old Slurm steps may omit array variables; the original batch identity is verified above.
+    if "_" in job_id and current == raw:
+        os.environ["SLURM_ARRAY_JOB_ID"], os.environ["SLURM_ARRAY_TASK_ID"] = job_id.split("_", 1)
+    cgroup, reason = discover_cgroup(raw)
+    group = target.group if os.environ.get("JOBMON_PROCESS_TREE") == "1" else None
+    metrics = sample_metrics(cgroup, reason, cpus, None, time.monotonic(), group)
+    if metrics["cpu_seconds"] is None and metrics["memory_bytes"] is None:
+        raise JobmonError("Cannot measure the job: " + "; ".join(metrics["errors"]))
+    if monitoring_active(job_id, include_reservation=False):
+        raise JobmonError("Monitoring is already active for job " + job_id)
+    node = checked_name(os.environ.get("SLURMD_NODENAME") or socket.gethostname())
+    attachment = {"node": node, "cpus": cpus, "job_name": request["job_name"],
+                  "batch_pid": target.pid, "batch_start_ticks": target.started, "process_group": target.group,
+                  "gpu_collection": "disabled for attached collectors"}
+    run_dir = initialize(run_id=run_id, attachment=attachment)
+    collect(run_dir, interval, stop=stop, target=target)
 
 
 def finish(run_dir, exit_code):
@@ -570,6 +747,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="command", required=True)
     subs.add_parser("init", help="create one shared run directory inside the allocation")
+    subs.add_parser("_attach", help=argparse.SUPPRESS)
     sample = subs.add_parser("run", help="run one collector on this allocation node")
     sample.add_argument("--run-dir", required=True)
     sample.add_argument("--interval", type=float, default=60)
@@ -583,11 +761,17 @@ def main(argv=None):
     try:
         if args.command == "init":
             print(initialize())
-        elif args.command == "run":
+        elif args.command in ("run", "_attach"):
             stop = threading.Event()
             for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(signum, lambda _signum, _frame: stop.set())
-            collect(args.run_dir, args.interval, args.once, stop)
+            if args.command == "_attach":
+                data = sys.stdin.read(8193)
+                if len(data) > 8192:
+                    raise JobmonError("Attachment request exceeds 8192 bytes.")
+                attach_collect(json.loads(data), stop)
+            else:
+                collect(args.run_dir, args.interval, args.once, stop)
         elif args.command == "stop":
             load_run(args.run_dir)
             try:

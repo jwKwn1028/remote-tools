@@ -1542,7 +1542,8 @@ class TransportTests(unittest.TestCase):
             fake.write_text("#!" + sys.executable + "\nimport json,os,sys\n"
                             "request = json.loads(sys.stdin.read())\n"
                             "with open(os.environ['SSH_CAPTURE'],'a') as f: f.write(json.dumps(request)+'\\n')\n"
-                            "sys.stdout.write(os.environ['JOBS_TABLE'] if request['operation'] == 'jobs'\n"
+                            "listing=request['operation'] in ('jobs','attach-jobs')\n"
+                            "sys.stdout.write(os.environ['JOBS_TABLE'] if listing\n"
                             "                 else 'watching ' + request['job_id'] + '\\n')\n")
             fake.chmod(0o700)
             env = {key: value for key, value in os.environ.items() if not key.startswith("HPC_JOBMON_")}
