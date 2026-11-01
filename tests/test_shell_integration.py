@@ -229,7 +229,6 @@ class RemoteBashrcTests(unittest.TestCase):
             interpreter.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\nexit 23\n')
             interpreter.chmod(0o700)
             fragment = base / "fragment.bash"
-            # A task-specific simulated home avoids touching real shell configuration.
             fragment.write_text(block.replace("$HOME", "${JOBMON_TEST_HOME}"))
             env = dict(
                 os.environ,

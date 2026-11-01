@@ -89,7 +89,6 @@ class LiveStateTests(unittest.TestCase):
         runtime = state.snapshot()["runs"][0]["runtime"]
         self.assertEqual((runtime["source"], runtime["seconds"], runtime["display"]),
                          ("slurm", 9610, "2:40:10"))
-        # File refreshes can advance while no new collector sample is saved.
         status = dict(packets[-1], scheduler=None, generated_at="2026-09-01T00:02:00+00:00")
         state.apply(status)
         self.assertEqual(state.snapshot()["runs"][0]["runtime"], runtime)
@@ -113,7 +112,6 @@ class LiveStateTests(unittest.TestCase):
         state.apply(dict(packets[1], run_id=second, point=point,
                          raw_sample=json.dumps(sample(330, run_id=second))))
         runs = state.snapshot()["runs"]
-        # The initial snapshot still belongs to the older allocation.
         self.assertEqual((runs[0]["runtime"]["source"], runs[0]["runtime"]["seconds"]), ("slurm", 300))
         self.assertEqual((runs[1]["runtime"]["source"], runs[1]["runtime"]["seconds"]), ("monitoring", 30))
 
@@ -141,7 +139,6 @@ class LiveStateTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 finish(invalid)
                 self.assertIsNone(state.snapshot()["runs"][0]["exit_code"])
-        # A final collector sample is not a wrapper completion record.
         state.apply(events([dict(sample(90, 60), final=True)])[1])
         self.assertIsNone(state.snapshot()["runs"][0]["exit_code"])
         for code in (0, 1, 137):
@@ -547,7 +544,6 @@ class LocalServerTests(unittest.TestCase):
         second = urlopen(self.server.url + "events", timeout=4)
         self.addCleanup(second.close)
         second.readline()
-        # A live replacement tab must outlast the shortened close grace.
         time.sleep(0.7)
         self.assertEqual(self.server.sessions, 1)
         self.assertFalse(self.server.stopping.is_set())
@@ -703,7 +699,6 @@ class SSHAndShellTests(unittest.TestCase):
         with patch.dict(os.environ, env), patch.object(live, "SSHSource") as source:
             discovery.refresh()
             self.assertEqual(state.snapshot()["queue_status"]["state"], "RUNNING")
-            # A failed query must not turn an empty response into a departure.
             listing.write_text(json.dumps({"exit": 23}))
             discovery.refresh()
             self.assertEqual(state.snapshot()["queue_status"]["state"], "RUNNING")
@@ -712,7 +707,6 @@ class SSHAndShellTests(unittest.TestCase):
             absent = state.snapshot()["queue_status"]
             self.assertIsNone(absent["state"])
             self.assertIsNotNone(jobmon.timestamp_seconds(absent["checked_at"]))
-            # The file stream can continue sending its original scheduler snapshot.
             state.jobs[0].apply(events()[-1])
             self.assertEqual(state.snapshot()["queue_status"], absent)
             self.assertEqual(state.snapshot()["runs"], before["runs"])
@@ -877,7 +871,7 @@ class SSHAndShellTests(unittest.TestCase):
                 patch.object(live.webbrowser, "open", side_effect=browser), \
                 contextlib.redirect_stdout(io.StringIO()):
             server.return_value.serve_forever.side_effect = serve
-            self.assertEqual(live.main([JOB_ID, "--host", "test-alias"]), 0)
+            self.assertEqual(live.main([JOB_ID, "--host", "test-alias", "--web"]), 0)
             source.return_value.close.assert_called_once()
 
     def test_main_starts_and_closes_every_job_and_isolates_a_failed_stream(self):
@@ -894,7 +888,7 @@ class SSHAndShellTests(unittest.TestCase):
                 return item
 
             source.side_effect = reader
-            self.assertEqual(live.main([JOB_ID, "456_2", "--host", "test-alias", "--no-browser"]), 0)
+            self.assertEqual(live.main([JOB_ID, "456_2", "--host", "test-alias", "--web", "--no-browser"]), 0)
             self.assertEqual([item.state.job_id for item in readers], [JOB_ID, "456_2"])
             for item in readers:
                 item.start.assert_called_once()
@@ -911,7 +905,7 @@ class SSHAndShellTests(unittest.TestCase):
                     patch.object(live, "SSHSource"), patch.object(live, "JobDiscovery") as discovery, \
                     patch.object(live, "DesktopNotifier") as notifier, \
                     contextlib.redirect_stdout(io.StringIO()):
-                args = [JOB_ID, "--host", "test-alias", "--no-browser"] + (["--follow"] if follow else [])
+                args = [JOB_ID, "--host", "test-alias", "--web", "--no-browser"] + (["--follow"] if follow else [])
                 self.assertEqual(live.main(args), 0)
                 self.assertEqual(discovery.call_args.kwargs, {"follow": follow})
                 discovery.return_value.start.assert_called_once()
@@ -939,7 +933,7 @@ class SSHAndShellTests(unittest.TestCase):
                 ([("900_0", "RUNNING"), ("../invalid", "RUNNING")], [], 2)):
             with self.subTest(rows=rows):
                 table = "JOB ID\tSTATE\n" + "".join("\t".join(row) + "\n" for row in rows)
-                result = subprocess.run(["zsh", "-f", "-c", 'source "$1"; hpc-live --no-browser',
+                result = subprocess.run(["zsh", "-f", "-c", 'source "$1"; hpc-live --web --no-browser',
                                          "test", str(ROOT / "shell/jobmon.zsh")],
                                         env=dict(env, JOBS_TABLE=table), stdin=subprocess.DEVNULL,
                                         capture_output=True, text=True, timeout=10)
@@ -947,7 +941,7 @@ class SSHAndShellTests(unittest.TestCase):
                 self.assertNotIn("Choose a running job", result.stderr)
                 if ids:
                     self.assertEqual(json.loads(result.stdout),
-                                     ids + ["--host", "test-alias", "--interval", "5", "--port", "0",
+                                     ids + ["--host", "test-alias", "--interval", "5", "--web",
                                             "--no-browser", "--follow"])
                 else:
                     self.assertFalse(result.stdout)
@@ -960,13 +954,26 @@ class SSHAndShellTests(unittest.TestCase):
         script.write_text("import json,sys\nprint(json.dumps(sys.argv[1:]))\n")
         env = {key: value for key, value in os.environ.items() if not key.startswith("HPC_JOBMON_")}
         env.update(HPC_JOBMON_HOST="test-alias", HPC_JOBMON_TOOLS_DIR=str(script.parent.parent))
-        result = subprocess.run(["zsh", "-f", "-c", 'source "$1"; hpc-live 123_7 --interval 2 --port 0 --no-browser',
-                                 "test", str(ROOT / "shell/jobmon.zsh")],
-                                env=env, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout),
-                         [JOB_ID, "--host", "test-alias", "--interval", "2", "--port", "0", "--no-browser"])
-        for args in ("--interval 0", "--interval 86401", "--port 65536", "--port", '"1;bad"', "123 --invalid"):
+        for arguments, expected in (
+                ("123_7 --interval 2 --web --port 0 --no-browser", ["--web", "--port", "0", "--no-browser"]),
+                ("123_7 --interval 2 --text", ["--text"]),
+                ("123_7 --interval 2", [])):
+            result = subprocess.run(["zsh", "-f", "-c", 'source "$1"; hpc-live ' + arguments,
+                                     "test", str(ROOT / "shell/jobmon.zsh")],
+                                    env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout),
+                             [JOB_ID, "--host", "test-alias", "--interval", "2"] + expected)
+        for args, message in (("123 --port 8080", "only with --web"), ("123 --no-browser", "only with --web"),
+                              ("123 --web --text", "terminal view, not --web")):
+            result = subprocess.run(["zsh", "-f", "-c", 'source "$1"; hpc-live ' + args, "test",
+                                     str(ROOT / "shell/jobmon.zsh")], env=env, capture_output=True, text=True,
+                                    timeout=10, stdin=subprocess.DEVNULL)
+            self.assertEqual(result.returncode, 2, (args, result.stderr))
+            self.assertIn(message, result.stderr)
+            self.assertFalse(result.stdout)
+        for args in ("--interval 0", "--interval 86401", "--web --port 65536", "--web --port", '--web --port "1;bad"',
+                     "123 --invalid"):
             command = 'source "$1"; hpc-live ' + args
             result = subprocess.run(["zsh", "-f", "-c", command, "test", str(ROOT / "shell/jobmon.zsh")],
                                     env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)

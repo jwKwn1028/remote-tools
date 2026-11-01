@@ -1,8 +1,7 @@
 # jobmon
 
-Personal Slurm monitoring with Python 3.8+ and the standard library:
-`squeue`/`sacct` reports, optional CPU/memory/GPU samples, and live browser charts.
-No administrator access or package installation required.
+Personal Slurm reports, optional CPU/memory/GPU samples, and live terminal/browser
+charts. Python 3.8+, standard library only; no administrator access required.
 
 An independent, minimal version of Princeton University's
 [Jobstats](https://github.com/PrincetonUniversity/jobstats).
@@ -15,7 +14,7 @@ export HPC_JOBMON_HOST=your-existing-ssh-alias
 source shell/jobmon.zsh
 hpc-jdeploy          # preview
 hpc-jdeploy --apply  # deploy
-hpc-jobs             # list your jobs
+hpc-jobs            # list jobs
 ```
 
 If remote Python needs modules or a custom path, configure

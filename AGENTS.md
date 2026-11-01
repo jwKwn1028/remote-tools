@@ -21,9 +21,13 @@ configuration, limitations, and daily usage.
 - `jobmon/plot.py`: workstation-only archive reader and standalone HTML/SVG time
   plots and dashboard-format ZIP exports; reuses report validation and CPU
   calculations, never extracts archives.
-- `jobmon/live.py`: loopback browser dashboard with one SSH sample stream per job;
-  also reads one-shot snapshots for ZIP exports. Uses the plot renderer and
-  shuts down after the last browser tab closes.
+- `jobmon/live.py`: one SSH sample stream per job, feeding the terminal view or,
+  with `--web`, a loopback browser dashboard that uses the plot renderer and shuts
+  down after the last browser tab closes. Also reads one-shot snapshots for ZIP
+  exports.
+- `jobmon/tui.py`: workstation-only terminal view: standard-library pixel charts
+  over the Kitty graphics protocol, a braille fallback, keys, and terminal
+  restoration. Layout is free of terminal I/O so it can be tested as text.
 - `shell/jobmon.zsh`: workstation commands such as `hpc-jobs`, `hpc-jreport`,
   `hpc-jattach`, `hpc-jfetch`, `hpc-live`, and `hpc-jdeploy`.
 - `shell/deploy-jobmon.sh`: explicit, checksum-verified, content-addressed remote
@@ -55,6 +59,10 @@ configuration, limitations, and daily usage.
   must not replace a scientific workload's result.
 - Require private storage ownership and permissions, reject symlinks for trusted
   state, and retain the login/compute shared-storage probe.
+- In the live view, saved text reaches the terminal only through `tui.fit`, so
+  control codes cannot act on it. Send graphics commands only after the terminal
+  confirms support, since tmux shows them as the pane title, and restore the
+  terminal on every exit.
 - Attribute GPU utilization only with verified full GPU UUIDs and explicit
   exclusive-use opt-in. Numeric ordinals, sharing, MPS, and MIG must not be
   presented as job-exclusive measurements.

@@ -109,7 +109,6 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(title().startswith("Job 123_7 (name unavailable):"))
 
     def test_unreadable_memory_request_has_no_invented_scope(self):
-        # The trailing letter of an unparseable request is not a per-CPU scope.
         for value in ("abc", "n", "c", "?c", "", None):
             with self.subTest(value=value):
                 request = requested_memory(value, 8, 2)
@@ -156,7 +155,6 @@ class SchedulerTests(unittest.TestCase):
 
         current = run(start + 2)
         self.assertEqual(jobmon.run_start(report([current]), current), ("slurm", start))
-        # A start after the run began belongs to a later, requeued allocation.
         early = run(start - 3600)
         self.assertEqual(jobmon.run_start(report([early]), early), ("monitoring", start - 3600))
         older, newer = run(start - 7200), run(start + 2)
@@ -602,7 +600,6 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(result["gpus"][0]["covered_device_seconds"], 0)
         self.assertTrue(result["errors"])
         self.assertTrue(all("invalid record" in error for error in result["errors"]))
-        # A valid sample at the rejected records' tick must still be accepted.
         self.append(self.record(tick=30, memory=200, cpu_delta=30))
         result = history.summary()
         self.assertEqual(result["nodes"]["node1"]["samples"], 2)
@@ -652,7 +649,6 @@ class StorageTests(unittest.TestCase):
         self.assertIsNone(record["metrics"]["cpu_seconds"])
         self.assertTrue(record["final"])
         self.assertEqual(record["metrics"]["scope"], "unavailable")
-        # The diagnostic keeps the cgroup reason and names the opt-in that would apply.
         joined = "; ".join(record["errors"])
         self.assertIn("no readable job cgroup", joined)
         self.assertIn("JOBMON_PROCESS_TREE=1", joined)
@@ -698,7 +694,6 @@ class StorageTests(unittest.TestCase):
             "runs": [run], "errors": [], "history_reason": None})
         self.assertIn("sampled peak 1000 B; kernel high-water 7.81 KiB", text)
         self.assertIn("Kernel high-water scope: kernel memory.peak high-water mark per node", text)
-        # One node: the run-level sums would only repeat the node's own readings.
         self.assertNotIn("Sum of independent", text)
 
     def test_missing_kernel_high_water_mark_is_named_not_zero(self):
@@ -735,7 +730,6 @@ class StorageTests(unittest.TestCase):
         text = jobmon.format_report(self.report_for(history.summary()))
         self.assertIn("CPU: last interval 37.5% (3.0 cores); average 25.0% (2.0 cores)", text)
         self.assertIn("Memory: latest 300 B; sampled peak 300 B", text)
-        # A gap leaves the newest interval unavailable, never zero, and keeps the average.
         late = self.record(tick=150, memory=300, cpu_delta=30)
         late["metrics"]["cpu_interval_seconds"] = 90
         self.append(late)
@@ -758,7 +752,6 @@ class StorageTests(unittest.TestCase):
                          "Kernel high-water scope", "5.19", "GPU averages", "bytes", "Completion:"):
             self.assertNotIn(repeated, text)
         self.assertIn("Memory: latest 36.17 GiB; sampled peak 36.17 GiB", text)
-        # Once the job has left the queue, a missing completion record is worth stating.
         self.assertIn("Completion: unavailable", jobmon.format_report(self.report_for(run)))
 
     def watch(self, sleep, count, clock, snapshot_tick=65, **options):
@@ -801,7 +794,6 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(text.count(once), 1, once)
         lines = text.splitlines()
         table = lines[lines.index(next(line for line in lines if line.startswith("CLOCK "))):]
-        # ELAPSED counts from Slurm's start (tick 5); the MAX columns keep the highest so far.
         self.assertEqual(table, [
             "CLOCK        ELAPSED  SAMPLES  CPU LAST 30 s    CPU AVG    CPU MAX       MEMORY   MEMORY MAX",
             "00:00:30        0:25        2          12.5%      12.5%      12.5%        100 B        100 B",
@@ -813,8 +805,6 @@ class StorageTests(unittest.TestCase):
         base = dt.datetime(2026, 9, 14, tzinfo=dt.timezone.utc).timestamp()
         self.append(self.record(tick=0))
         self.append(self.record(tick=30, cpu_delta=30))
-        # --count bounds refreshes, so a stalled collector cannot hold the watch open.
-        # 70 s after the last sample is within the limit; the second refresh, at 80 s, is not.
         text, sleeps = self.watch(lambda calls: None, 6, [base + 100])
         self.assertEqual(len(sleeps), 5)
         self.assertEqual(text.count("no new sample for"), 1)
@@ -996,7 +986,6 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(any("repetition" in error for error in metadata["errors"]))
 
     def test_unusable_cpu_counts_are_never_written_as_unreadable_metadata(self):
-        # initialize must not store a layout that load_run would reject forever.
         for layout in ("0", "8,4", "8(x2)"):
             with self.subTest(layout=layout), patch.dict(os.environ, {"SLURM_JOB_CPUS_PER_NODE": layout}):
                 run = collect.initialize(runner=lambda argv: "node1\n")
@@ -1022,7 +1011,6 @@ class StorageTests(unittest.TestCase):
         collect.wait_for_next_sample(self.run, Stub(), collect.time.monotonic() + 3600)
         self.assertEqual(waits, [collect.STOP_POLL_SECONDS])
         self.assertGreater(collect.STOP_POLL_SECONDS, 1)
-        # A short interval must still bound the wait by its own remaining time.
         waits.clear()
         collect.wait_for_next_sample(self.run, Stub(), collect.time.monotonic() + 0.25)
         self.assertLessEqual(waits[0], 0.25)
@@ -1039,7 +1027,6 @@ class StorageTests(unittest.TestCase):
         self.assertIsNotNone(run["cpu_percent_covered_intervals"])
         self.assertIn("process group", run["memory_scope"])
         self.assertNotIn("cgroup charges", run["memory_scope"])
-        # The scope, not the kernel version, is why there is no high-water mark.
         self.assertIn("process-tree sampling has no kernel high-water mark",
                       run["unavailable_metrics"]["cgroup_memory_peak_bytes"])
         self.assertNotIn("5.19", run["unavailable_metrics"]["cgroup_memory_peak_bytes"])
@@ -1060,7 +1047,6 @@ class StorageTests(unittest.TestCase):
 
     def test_unrelated_storage_entry_is_ignored_and_never_blocks_a_fetch(self):
         self.append(self.record())
-        # Shared storage leaves stubs like .nfs00000001 beside the run directories.
         for name in (".nfs00000001", "notes.txt"):
             (self.root / "123_7" / name).write_text("")
         history = jobmon.SavedHistory("123_7")
@@ -1488,7 +1474,6 @@ class TransportTests(unittest.TestCase):
             clone = base / "anywhere/my-clone"
             for name in ("jobmon", "shell", "examples"):
                 shutil.copytree(ROOT / name, clone / name, ignore=shutil.ignore_patterns("__pycache__"))
-            # A dotfile manager typically links the helpers into place.
             module = base / "home/.zsh/jobmon.zsh"
             module.parent.mkdir()
             module.symlink_to(clone / "shell/jobmon.zsh")
@@ -1501,7 +1486,6 @@ class TransportTests(unittest.TestCase):
             self.assertIn("Preview only", result.stdout)
             self.assertIn(str(clone.resolve() / "jobmon/jobmon.py"), result.stdout)
             self.assertIn("test-alias", self.last_call(capture)["args"])
-            # An explicit HPC_JOBMON_TOOLS_DIR still takes precedence.
             result = subprocess.run(["zsh", "-f", "-c", script, "test", str(module)],
                                     env=dict(env, HPC_JOBMON_TOOLS_DIR=str(base / "missing")),
                                     capture_output=True, text=True, timeout=15,
@@ -1558,7 +1542,6 @@ class TransportTests(unittest.TestCase):
             pid, fd = pty.fork()
             if pid == 0:
                 try:
-                    # Report terminal settings afterwards: the menu must restore signal keys and echo.
                     script = ('source "$1"; shift; ' + command + ' "$@"; rc=$?; '
                               'print -r -- "terminal:" $(stty -a </dev/tty | tr " " "\\n" '
                               '| grep -xE -- "-?(isig|echo)"); exit $rc')
@@ -1574,7 +1557,6 @@ class TransportTests(unittest.TestCase):
                     finished, status = os.waitpid(pid, os.WNOHANG)
                     if finished:
                         break
-                    # Each key is sent once the menu has been drawn, then redrawn.
                     if pending and output.count(b"q or Esc: cancel") > len(keys) - len(pending):
                         os.write(fd, pending.pop(0))
                     if select.select([fd], [], [], 0.05)[0]:
@@ -1644,7 +1626,6 @@ class TransportTests(unittest.TestCase):
                 self.assertIn("Choose a running job to watch (1/3; 2 queued or not running)", first)
                 self.assertIn("\x1b[7m> 900_0 ", first)
                 self.assertNotIn("900_2", first)
-                # The menu is erased and the cursor shown again before watching starts.
                 after = screen[screen.rindex("q or Esc: cancel"):]
                 self.assertIn("\x1b[J\x1b[?25h", after)
                 self.assertIn("watching " + chosen, after)
@@ -1659,7 +1640,6 @@ class TransportTests(unittest.TestCase):
                 self.assertEqual(requests, [{"operation": "jobs"}])
                 after = screen[screen.rindex("q or Esc: cancel"):]
                 self.assertIn("\x1b[J\x1b[?25h", after)
-                # Ctrl-C is read as a key while the menu is open, and signal keys come back.
                 self.assertNotIn("^C", after)
                 self.assertIn("terminal: isig echo", after)
 
@@ -1736,8 +1716,6 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(Path(archive).read_bytes(), b"archive")
 
     def test_default_sampling_interval_is_one_minute(self):
-        # The wrapper, the collector, and the example env.sh must agree, or a copied
-        # env.sh silently pins a different default.
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             log, run_dir = base / "collector.jsonl", base / "run"

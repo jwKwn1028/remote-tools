@@ -1,6 +1,6 @@
-# Source from zsh; set HPC_JOBMON_HOST privately to an SSH alias or user@host.
+# Source in Zsh; set HPC_JOBMON_HOST privately.
 
-# Locate bundled tools while sourcing; :A resolves symlinked modules.
+# Resolve bundle path through symlinks.
 () {
   emulate -L zsh
   typeset -g _jobmon_bundle_dir=${${(%):-%x}:A:h:h}
@@ -21,7 +21,7 @@ _jobmon_ssh() {
   emulate -L zsh
   local REPLY
   _jobmon_host || return
-  # This command is constant: HOME, interpreter, and environment resolve remotely.
+  # JSON arguments go on stdin.
   local remote_command='if [ -r "$HOME/.config/jobmon/env.sh" ]; then . "$HOME/.config/jobmon/env.sh" || exit; fi; exec "${JOBMON_PYTHON:-python3}" "$HOME/.local/libexec/jobmon/jobmon.py" _transport'
   command ssh -T -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 -- "$REPLY" "$remote_command"
 }
@@ -86,7 +86,6 @@ _jobmon_request() {
   done
   [[ $operation == attach ]] && request+=',"interval":'$sampling_interval
   if [[ $operation == watch ]]; then
-    # Display watch times in the workstation's UTC offset.
     local zone=${(%):-%D{%z}}
     if [[ $zone == [+-][0-9][0-9][0-9][0-9] ]]; then
       request+=',"utc_offset_minutes":'$(( ${zone[1]}1 * (10#${zone[2,3]} * 60 + 10#${zone[4,5]}) ))
@@ -96,7 +95,7 @@ _jobmon_request() {
   print -r -- "$request" | _jobmon_ssh
 }
 
-# Return the selected running job in REPLY; use /dev/tty to keep stdout clean.
+# Set REPLY; render on /dev/tty.
 _jobmon_choose_job() {
   emulate -L zsh
   local action=${1:-watch} operation=jobs
@@ -112,7 +111,6 @@ _jobmon_choose_job() {
   for line in ${(f)output}; do
     fields=("${(@ps:\t:)line}")
     [[ $fields[1] == 'JOB ID' ]] && continue
-    # Only a started job can have samples to watch; the others are counted, not listed.
     if [[ $fields[2] == (RUNNING|COMPLETING) && $fields[1] =~ $job_pattern ]]; then
       ids+=("$fields[1]")
       rows+=("$(printf '%-16s %-20.20s %-11s %11s %5s %5s  %s' \
@@ -141,8 +139,7 @@ _jobmon_choose_job() {
   visible=$(( count < ${LINES:-24} - 4 ? count : ${LINES:-24} - 4 ))
   (( visible < 1 )) && visible=1
   width=$(( ${COLUMNS:-80} - 3 ))
-  # Read Ctrl-C as cancel without echo; trap external SIGINT locally.
-  # emulate -L restores the caller's TRAPINT.
+  # Read Ctrl-C; emulate -L restores TRAPINT.
   TRAPINT() { return 130 }
   {
     terminal=$(command stty -g </dev/tty) && command stty -isig -echo </dev/tty
@@ -170,7 +167,7 @@ _jobmon_choose_job() {
         j|J) (( selected < count )) && (( ++selected )) ;;
         k|K) (( selected > 1 )) && (( --selected )) ;;
         $'\e')
-          # An arrow key is Esc plus two bytes; Esc alone cancels.
+          # Arrows follow Esc; Esc alone cancels.
           rest=''
           read -sk 2 -t 0.05 rest
           case $rest in
@@ -184,7 +181,6 @@ _jobmon_choose_job() {
       esac
     done
   } always {
-    # Clear the menu and restore the cursor and terminal on every exit.
     frame=$'\r'
     (( drawn > 1 )) && frame+=$'\e['$(( drawn - 1 ))'A'
     print -rn -- "$frame"$'\e[J\e[?25h' >/dev/tty
@@ -198,7 +194,6 @@ hpc-jobs() { emulate -L zsh; _jobmon_request jobs "$@"; }
 hpc-job() { emulate -L zsh; _jobmon_request show "$@"; }
 hpc-jwatch() {
   emulate -L zsh
-  # Without a job ID, choose one of your running jobs; options still follow.
   if (( ! $# )) || [[ $1 == -* ]]; then
     local REPLY
     _jobmon_choose_job || return
@@ -336,16 +331,19 @@ hpc-jreport() {
 
 hpc-live() {
   emulate -L zsh
-  local job_id='' interval=5 port=0 host REPLY option value
+  local job_id='' interval=5 port='' host REPLY option value
   local job_pattern='^[1-9][0-9]*(_[0-9]+)?$'
   local tools_dir=${HPC_JOBMON_TOOLS_DIR:-${_jobmon_bundle_dir:-}}
+  local -i web=0 text=0 no_browser=0
   local -a options fields
   local -aU job_ids
   while (( $# )); do
     case $1 in
       -h|--help)
-        print -r -- 'Usage: hpc-live [JOB_ID] [--interval SECONDS] [--port PORT] [--no-browser]'
-        print -r -- 'Without an ID, opens running jobs as tabs and adds newly running jobs every 30 seconds.'
+        print -r -- 'Usage: hpc-live [JOB_ID] [--interval SECONDS] [--text] [--web [--port PORT] [--no-browser]]'
+        print -r -- 'Without an ID, shows running jobs as tabs and adds newly running jobs every 30 seconds.'
+        print -r -- 'Opens in this terminal with pixel charts where it supports Kitty graphics, otherwise'
+        print -r -- 'character charts; --text forces those. --web opens the browser dashboard instead.'
         return 0
         ;;
       --interval|--port)
@@ -361,10 +359,12 @@ hpc-live() {
         if [[ $option == --interval ]]; then interval=$value; else port=$value; fi
         shift 2
         ;;
-      --no-browser) options+=(--no-browser); shift ;;
+      --web) web=1; shift ;;
+      --text) text=1; shift ;;
+      --no-browser) no_browser=1; shift ;;
       *)
         if [[ -n $job_id || ! $1 =~ $job_pattern || ${#1} -gt 40 ]]; then
-          print -u2 -- 'Usage: hpc-live [JOB_ID] [--interval SECONDS] [--port PORT] [--no-browser]'
+          print -u2 -- 'Usage: hpc-live [JOB_ID] [--interval SECONDS] [--text] [--web [--port PORT] [--no-browser]]'
           return 2
         fi
         job_id=$1
@@ -372,6 +372,18 @@ hpc-live() {
         ;;
     esac
   done
+  if (( ! web )) && [[ -n $port ]] || (( ! web && no_browser )); then
+    print -u2 -- 'jobmon: --port and --no-browser apply only with --web.'
+    return 2
+  fi
+  if (( web && text )); then
+    print -u2 -- 'jobmon: --text applies to the terminal view, not --web.'
+    return 2
+  fi
+  (( web )) && options+=(--web)
+  (( text )) && options+=(--text)
+  [[ -n $port ]] && options+=(--port "$port")
+  (( no_browser )) && options+=(--no-browser)
   if [[ ! -r $tools_dir/jobmon/live.py ]]; then
     print -u2 -- 'jobmon: cannot find jobmon/live.py; source helpers from the clone or set HPC_JOBMON_TOOLS_DIR.'
     return 2
@@ -408,7 +420,7 @@ hpc-live() {
   _jobmon_host || return
   host=$REPLY
   command python3 "$tools_dir/jobmon/live.py" "${job_ids[@]}" --host "$host" \
-    --interval "$interval" --port "$port" "${options[@]}"
+    --interval "$interval" "${options[@]}"
 }
 
 hpc-jdeploy() {

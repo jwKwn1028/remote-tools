@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local browser dashboard for per-job saved-sample JSON-over-SSH streams."""
+"""Live saved samples over SSH, in a terminal or browser."""
 
 import argparse
 import bisect
@@ -21,14 +21,15 @@ from urllib.parse import urlsplit
 import webbrowser
 
 from collect import SCHEMA_VERSION, checked_name, utc_now
-from jobmon import MAX_LINE, MEMORY_SCOPE_NOTES, display_job_name, timestamp_seconds
-from plot import metadata_for_plot, render_html, with_runtime, write_exports
+from jobmon import MAX_LINE, MEMORY_SCOPE_NOTES, display_job_name
+from plot import completion_result, metadata_for_plot, render_html, with_runtime, write_exports
 from slurm_backend import JobmonError, validate_job_id
+import tui
 
-# As in _jobmon_ssh: user arguments travel only in JSON on stdin.
+# Arguments use JSON stdin.
 REMOTE_COMMAND = ('if [ -r "$HOME/.config/jobmon/env.sh" ]; then . "$HOME/.config/jobmon/env.sh" || exit; fi; '
                   'exec "${JOBMON_PYTHON:-python3}" "$HOME/.local/libexec/jobmon/jobmon.py" _transport')
-# Allow for JSON escaping when raw samples are nested inside events.
+# Allow nested JSON escaping.
 MAX_EVENT_LINE = 4 * MAX_LINE
 SNAPSHOT_TIMEOUT = 120
 DISCOVERY_INTERVAL = 30
@@ -185,15 +186,25 @@ class LiveState:
                 self.group.notifier.observe(self)
             self._notify()
 
+    def _connection(self):
+        if self.connection == "Live" and time.monotonic() - self.last_received > max(30, self.interval * 3):
+            return "Waiting for remote stream"
+        return self.connection
+
+    def summary(self):
+        with self.changed:
+            runs = [{"run_id": run["run_id"], "job_name": run["job_name"], "exit_code": run["exit_code"],
+                     "metadata": {key: run["metadata"].get(key) for key in ("created_at", "attachment")}}
+                    for _, run in sorted(self.runs.items())]
+            return {"job_id": self.job_id, "connection": self._connection(), "runs": runs,
+                    "queue_status": copy.deepcopy(self.queue_status)}
+
     def snapshot(self):
         with self.changed:
-            connection = self.connection
-            if connection == "Live" and time.monotonic() - self.last_received > max(30, self.interval * 3):
-                connection = "Waiting for remote stream"
             runs = [dict(run, nodes=[run["nodes"][node] for node in sorted(run["nodes"])])
                     for _, run in sorted(self.runs.items())]
             return copy.deepcopy(with_runtime({"job_id": self.job_id, "runs": runs, "scope_notes": MEMORY_SCOPE_NOTES,
-                "diagnostics": list(self.errors), "live": True, "connection": connection,
+                "diagnostics": list(self.errors), "live": True, "connection": self._connection(),
                 "updated_at": self.updated_at, "scheduler": self.scheduler,
                 "scheduler_snapshot_at": self.scheduler_snapshot_at, "queue_status": self.queue_status}))
 
@@ -220,6 +231,13 @@ class MultiJobState:
             self.version += 1
             self.changed.notify_all()
             return job
+
+    def view(self, job_id):
+        """Selected history and lightweight job tabs."""
+        with self.changed:
+            selected = next(job for job in self.jobs if job.job_id == job_id)
+            return {"jobs": [job.summary() for job in self.jobs], "job": selected.snapshot(),
+                    "discovery_error": self.discovery_error}
 
     def set_discovery_error(self, message):
         with self.changed:
@@ -254,7 +272,7 @@ class DesktopNotifier:
         self.thread.start()
 
     def observe(self, job):
-        # Called under the shared state lock, after a complete status or queue check.
+        # Under the shared lock, after status/queue updates.
         status = job.queue_status
         states = [row.get("state") for row in (job.scheduler or {}).get("queue", [])]
         if status is not None:
@@ -272,14 +290,9 @@ class DesktopNotifier:
         key = (job.job_id, run_id)
         if key in self.seen or key in self.inflight:
             return
-        completed = run is not None and type(run["exit_code"]) is int
-        if not completed:
-            if status is None or status["state"] is not None or job.job_id not in self.active:
-                return
-            checked = timestamp_seconds(status["checked_at"])
-            created = timestamp_seconds(run["metadata"].get("created_at")) if run else None
-            if checked is None or (created is not None and created > checked):
-                return
+        result = completion_result(job.job_id, run, status)
+        if result is None or (result["kind"] == "unknown" and job.job_id not in self.active):
+            return
         snapshot = job.snapshot()
         saved = snapshot["runs"][-1] if run is not None else {}
         name = saved.get("job_name") or next((row.get("job_name") for row in
@@ -599,7 +612,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         version = -1
         try:
             self.send_headers(200, "text/event-stream")
-            # Reconnect sooner than the close grace expires after a brief drop.
+            # Reconnect before the tab-close grace expires.
             self.wfile.write(b"retry: 100\n\n")
             while not server.stopping.is_set():
                 with server.state.changed:
@@ -610,7 +623,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     payload = json.dumps(server.state.snapshot(), allow_nan=False) if changed else None
                 self.wfile.write(("data: " + payload + "\n\n" if payload else ": heartbeat\n\n").encode())
                 self.wfile.flush()
-                # Coalesce an initial history burst rather than repainting per sample.
                 server.stopping.wait(server.session_tick)
         finally:
             with server.lifecycle:
@@ -620,7 +632,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def open_browser(url):
-    # Browser launchers may block until closed; serve HTTP independently.
+    # Browser launchers can block; serve HTTP separately.
     try:
         if not webbrowser.open(url):
             print("Open the printed URL in your browser.", file=sys.stderr)
@@ -633,17 +645,23 @@ def main(argv=None):
     parser.add_argument("job_id", nargs="+", metavar="JOB_ID")
     parser.add_argument("--host", required=True)
     parser.add_argument("--interval", type=int, default=5, help="remote saved-file refresh seconds")
-    parser.add_argument("--port", type=int, default=0, help="local port; 0 chooses a free port")
-    parser.add_argument("--no-browser", action="store_true", help="print the URL without opening it")
+    parser.add_argument("--web", action="store_true", help="open the browser dashboard, not the terminal view")
+    parser.add_argument("--text", action="store_true", help="draw terminal charts with characters, not pixels")
+    parser.add_argument("--port", type=int, help="with --web: local port; 0 or unset chooses a free port")
+    parser.add_argument("--no-browser", action="store_true", help="with --web: print the URL without opening it")
     parser.add_argument("--follow", action="store_true", help="discover newly running jobs every 30 seconds")
     parser.add_argument("--zip", action="store_true", help="save CPU and memory ZIPs and exit")
-    parser.add_argument("--output-dir", default="downloads", help="private ZIP output directory")
+    parser.add_argument("--output-dir", default="downloads", help="private ZIP output directory, also for saves")
     parser.add_argument("--days", type=int, default=30, help="accounting lookback for ZIP export")
     args = parser.parse_args(argv)
     sources, server, discovery, notifier = [], None, None, None
     try:
-        if not 1 <= args.interval <= 86400 or not 0 <= args.port <= 65535:
+        if not 1 <= args.interval <= 86400 or not 0 <= (args.port or 0) <= 65535:
             raise JobmonError("Interval must be 1–86400 seconds and port must be 0–65535.")
+        if not args.zip and not args.web and (args.port is not None or args.no_browser):
+            raise JobmonError("--port and --no-browser apply only with --web.")
+        if args.web and args.text:
+            raise JobmonError("--text applies to the terminal view, not --web.")
         if not 1 <= args.days <= 3650 or (args.zip and (len(args.job_id) != 1 or args.follow)):
             raise JobmonError("ZIP export needs one job ID; days must be 1–3650.")
         state = MultiJobState(args.job_id, args.interval)
@@ -659,11 +677,14 @@ def main(argv=None):
             for path in write_exports(state.snapshot(), args.output_dir):
                 print(path, flush=True)
             return 0
+        if not args.web and not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise JobmonError("The terminal view needs an interactive terminal; add --web for the browser dashboard.")
         notifier = DesktopNotifier()
         state.notifier = notifier
         notifier.start()
         sources = [SSHSource(job, args.host) for job in state.jobs]
-        server = DashboardServer(state, args.port)
+        if args.web:
+            server = DashboardServer(state, args.port or 0)
         for source in sources:
             try:
                 source.start()
@@ -673,6 +694,8 @@ def main(argv=None):
                 source.state.disconnected("Could not start remote stream: " + str(exc))
         discovery = JobDiscovery(state, args.host, sources, follow=args.follow)
         discovery.start()
+        if not args.web:
+            return tui.run(state, text_only=args.text, output_dir=args.output_dir)
         print("hpc-live: " + server.url, flush=True)
         print("Close the last dashboard browser tab or press Ctrl-C to stop viewing.", flush=True)
         if not args.no_browser:

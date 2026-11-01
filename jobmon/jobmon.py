@@ -24,10 +24,9 @@ from slurm_backend import (JobmonError, SlurmBackend, accounting_disabled, cpu_s
                            validate_job_id)
 
 MAX_LINE = 1024 * 1024
-# Bound a fast node's pending readings while another node's file is delayed.
+# Bound pending readings while other nodes lag.
 MEMORY_ALIGNMENT_BUFFER_SAMPLES = 128
 ATTACH_START_TIMEOUT = 45
-# Scopes that carry per-node memory readings, with the wording each one earns.
 MEMORY_SCOPE_NOTES = {
     "job_cgroup_v2": "job cgroup charges including cache; not process RSS; independent peaks are not concurrent",
     "process_tree_pgid": "summed process RSS within the batch process group; shared pages are counted once per "
@@ -43,7 +42,7 @@ def timestamp_seconds(value):
 
 
 class RunHistory:
-    """Incremental JSONL reader and streaming aggregates, bounded by nodes/devices."""
+    """Incremental JSONL aggregates, bounded by nodes/devices."""
 
     def __init__(self, directory, metadata, on_sample=None):
         self.directory = directory
@@ -99,7 +98,7 @@ class RunHistory:
                     or not isinstance(gpu.get("unavailable_fields", []), list)
                     or any(not isinstance(field, str) for field in gpu.get("unavailable_fields", []))):
                 raise ValueError("invalid GPU record")
-        # Finish all parsing that can reject a record before touching aggregates.
+        # Validate before updating aggregates.
         try:
             tick = number(record.get("monotonic_seconds"))
             interval = number(record.get("interval_seconds"))
@@ -140,7 +139,6 @@ class RunHistory:
         state["allocated_cpus"] = cpus
         valid_interval = delta is not None and duration and duration <= interval * 1.5
         if newest:
-            # Keep recent changes visible; first samples, resets, and gaps stay unavailable.
             state["interval_seconds"] = interval
             state["latest_interval_busy_cores"] = delta / duration if valid_interval else None
             state["latest_interval_cpu_percent"] = (100 * delta / (duration * cpus)
@@ -150,7 +148,6 @@ class RunHistory:
             state["cpu_seconds_available"] = True
             state["cpu_seconds_covered"] += delta
             state["cpu_wall_seconds_covered"] += duration
-            # Retain the busiest interval.
             state["max_interval_busy_cores"] = max(delta / duration, state["max_interval_busy_cores"] or 0)
             if cpus:
                 state["max_interval_cpu_percent"] = max(100 * delta / (duration * cpus),
@@ -203,7 +200,7 @@ class RunHistory:
                 entry = (when, stream_name, self.memory_sequence, node, current, interval)
                 bisect.insort(self.pending_memory.setdefault(node, []), entry)
         if all(n in self.nodes for n in expected):
-            # Commit only through the slowest node; later records can revise tail peaks.
+            # Commit through the slowest node; tail peaks may change.
             watermark = min(self.nodes[n]["last"] for n in expected)
             ready = []
             for pending in self.pending_memory.values():
@@ -238,7 +235,6 @@ class RunHistory:
         return peak, samples
 
     def refresh(self):
-        # One pending record per stream bounds memory while preserving chronological alignment.
         pending = []
         with ExitStack() as opened:
             for path in sorted(self.directory.glob("*.jsonl")):
@@ -296,7 +292,6 @@ class RunHistory:
 
     def summary(self):
         self.refresh()
-        # Tail peaks remain provisional until delayed nodes confirm their alignment.
         pending = [entry for entries in self.pending_memory.values() for entry in entries]
         concurrent_peak, aligned_samples = self.align_memory(
             pending, dict(self.latest_memory), self.concurrent_memory_peak, self.aligned_memory_samples)
@@ -400,7 +395,7 @@ class SavedHistory:
         for path in sorted(directory.iterdir()):
             if path.name in self.runs:
                 continue
-            # Skip unrelated files such as .nfs stubs; load_run still rejects symlinked directories.
+            # Ignore .nfs/unrelated files; load_run rejects symlinked runs.
             if not path.is_dir():
                 if path.name not in self.ignored:
                     self.ignored.append(path.name)
@@ -423,7 +418,6 @@ def build_report(job_id, days=30, live=False, backend=None, on_sample=None):
     runs = history.refresh()
     if not scheduler["ownership_verified"] and not runs:
         diagnostics = scheduler["errors"] + history.errors
-        # A disabled accounting database is a site limitation; widening --days cannot help.
         guidance = ("Completed jobs have no scheduler record here; use the opt-in collector for future jobs."
                     if any(accounting_disabled(entry) for entry in diagnostics)
                     else "Check the ID, --days, and storage.")
@@ -446,16 +440,18 @@ def display_scalar(value):
     return "unavailable" if value is None or value == "" else str(value)
 
 
+def printable_text(value):
+    return "".join(char if char.isprintable() else char.encode("unicode_escape").decode("ascii")
+                   for char in value)
+
+
 def display_job_name(value):
     if not isinstance(value, str) or not value.strip():
         return "unavailable"
-    # Keep names on one terminal/table line without interpreting control codes.
-    return "".join(char if char.isprintable() else char.encode("unicode_escape").decode("ascii")
-                   for char in value.strip())
+    return printable_text(value.strip())
 
 
 def display_bytes(value, missing="unavailable"):
-    # Binary units for reading; JSON output keeps exact byte counts.
     if value is None:
         return missing
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -475,7 +471,7 @@ def display_cpu(percent, cores, missing="unavailable"):
 
 
 def average_cpu(state):
-    """Covered-interval average for one node, as (percent of allocated cores, busy cores)."""
+    """Return covered-interval (CPU percent, busy cores)."""
     wall = state.get("cpu_wall_seconds_covered")
     if not state.get("cpu_seconds_available") or not wall:
         return None, None
@@ -489,7 +485,6 @@ METRIC_LABELS = {"cpu_percent_covered_intervals": "CPU percentage",
 
 
 def sample_point(history, record):
-    """One validated reading, using the same covered-interval values as watch."""
     state = history.nodes[record["node"]]
     metrics = record["metrics"]
     delta, duration = number(metrics.get("cpu_delta_seconds")), number(metrics.get("cpu_interval_seconds"))
@@ -511,7 +506,6 @@ def sample_point(history, record):
 
 
 def stream_history(job_id, interval=5, count=None, days=30):
-    """Stream all initial samples, then only validated appended records."""
     known = set()
     written = 0
 
@@ -593,7 +587,6 @@ def format_report(report):
             run["latest_sample_timestamp"] or "unavailable", display_value(run["sample_age_seconds"])))
         lines.append("  CPU {} of allocated cores over {:.0f} sampled core-seconds".format(
             display_value(run["cpu_percent_covered_intervals"], "%"), run["cpu_covered_core_seconds"]))
-        # On a single node, these aggregate peaks duplicate the node's peak.
         if multi_node(run):
             lines.append("  Memory across nodes: concurrent peak {}; sum of independent node peaks {}".format(
                 display_bytes(run["concurrent_memory_peak_bytes"]),
@@ -621,7 +614,6 @@ def format_report(report):
                 gpu["uuid"], gpu["node"], display_value(gpu["device_utilization_percent"], "%"),
                 display_value(gpu["job_utilization_percent"], "%"), gpu["scope"],
                 display_value(gpu["covered_device_seconds"])))
-        # While the job is still queued or running, a missing completion is expected.
         if run["completion"] or not scheduler["queue"]:
             lines.append("  Completion: {}; all expected collectors final: {}".format(
                 run["completion"]["workload_exit_code"] if run["completion"] else "unavailable",
@@ -641,15 +633,12 @@ def format_report(report):
     return "\n".join(lines)
 
 
-# Staleness allows shared-filesystem delays, including at short sampling intervals.
 STALE_FACTOR = 2.5
 STALE_MARGIN_SECONDS = 30
-# Gaps that hold for a whole run, so a watch states them once instead of per row.
 STRUCTURAL_GAPS = ("cgroup_memory_peak_bytes", "gpus")
 
 
 def clock_time(seconds, tz=None):
-    # tz None means this host's local zone; a fixed offset comes from the workstation.
     return dt.datetime.fromtimestamp(seconds, tz).strftime("%H:%M:%S") if seconds else "--:--:--"
 
 
@@ -665,8 +654,8 @@ def display_zone(tz):
 
 
 def display_elapsed(seconds):
-    """Slurm's elapsed-time layout, as squeue prints it: M:SS, H:MM:SS, or D-HH:MM:SS."""
-    # A second or two before the start is clock skew between hosts, not a real gap.
+    """Slurm elapsed format: M:SS, H:MM:SS, D-HH:MM:SS."""
+    # Small negatives are clock skew between hosts.
     if seconds is None or seconds < -60:
         return "-"
     days, rest = divmod(int(max(0, seconds)), 86400)
@@ -680,7 +669,7 @@ def display_elapsed(seconds):
 
 
 def run_start(report, run):
-    """Where a run's ELAPSED column counts from: ("slurm" or "monitoring", epoch seconds)."""
+    """Return ("slurm" or "monitoring", start epoch)."""
     created = timestamp_seconds(run["metadata"].get("created_at"))
     newest = max((timestamp_seconds(other["metadata"].get("created_at")) or 0 for other in report["runs"]),
                  default=0)
@@ -688,7 +677,7 @@ def run_start(report, run):
     if created is not None and created >= newest and snapshot is not None:
         for queue in report["scheduler"]["queue"]:
             elapsed = cpu_seconds(queue.get("elapsed"))
-            # Prefer Slurm's start unless it belongs to a later, requeued allocation.
+            # Ignore Slurm starts from later requeues.
             if (queue.get("state") in ("RUNNING", "COMPLETING") and elapsed is not None
                     and snapshot - elapsed <= created + 60):
                 return "slurm", snapshot - elapsed
@@ -719,7 +708,6 @@ def watch_header(report, tz):
     name = watch_job_name(report)
     label = "{} ({})".format(report["job_id"], display_job_name(name) if name is not None else "name unavailable")
     lines = ["Job {}: watching saved samples; CLOCK is {}; Ctrl-C stops viewing".format(label, display_zone(tz))]
-    # Watch reads Slurm once, so say when, rather than repeat a frozen elapsed time.
     for queue in scheduler["queue"]:
         lines.append("Scheduler at {}: {state}, elapsed {elapsed}, {cpus} CPUs on {nodes} node(s), "
                      "{reason_or_nodes}; not refreshed while watching".format(at, **queue))
@@ -736,7 +724,6 @@ def watch_header(report, tz):
 
 
 class WatchLayout:
-    """One run's table: column widths and the origin of its ELAPSED column."""
 
     def __init__(self, report, run, tz):
         self.multi = multi_node(run)
@@ -794,7 +781,7 @@ class WatchLayout:
 
 
 def watch_complete(report):
-    """The newest saved run has a wrapper exit and verified final samples."""
+    """Require newest wrapper exit and all expected finals."""
     if not report["runs"]:
         return False
     newest = max(report["runs"], key=lambda run: (
@@ -803,7 +790,6 @@ def watch_complete(report):
 
 
 class WatchView:
-    """Text watch: state fixed context once, then a row only when a sample arrives."""
 
     def __init__(self, tz=None, exit_on_completion=False):
         self.tz = tz
@@ -920,7 +906,7 @@ def emit(value, as_json=False):
 
 
 def export_history(job_id):
-    # Validate private ownership before emitting even the archive header.
+    # Check private ownership before writing archive headers.
     history = SavedHistory(job_id)
     history.refresh()
     if not history.runs or history.errors:
@@ -937,7 +923,7 @@ def export_history(job_id):
                 if path.name not in ("metadata.json", "completion.json", "stop.json") and path.suffix != ".jsonl":
                     continue
                 with private_open(path, os.O_RDONLY) as stream:
-                    # Snapshot size: appends during fetch are excluded, a partial final line is OK.
+                    # Freeze size; exclude later appends, allow partial tails.
                     info = tarfile.TarInfo("{}/{}/{}".format(job_id, run_id, path.name))
                     info.size = os.fstat(stream.fileno()).st_size
                     info.mode = 0o600
@@ -1119,7 +1105,6 @@ def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=
     if not report["runs"]:
         emit(report, as_json)
         raise JobmonError("No collector history to watch. Use show/report for an on-demand scheduler snapshot.")
-    # The workstation helper sends its UTC offset; direct use keeps this host's zone.
     zone = None if utc_offset_minutes is None else dt.timezone(dt.timedelta(minutes=utc_offset_minutes))
     view = None if as_json else WatchView(zone, exit_on_completion)
     displayed = 0
@@ -1135,12 +1120,11 @@ def execute(operation, job_id=None, as_json=False, interval=5, count=None, days=
                 print("{}  Watch finished for the latest saved run.".format(
                     clock_time(time.time(), zone)), flush=True)
             return
-        # --count bounds refreshes, not new samples, so it ends even if collection stops.
         displayed += 1
         if count is not None and displayed >= count:
             return
         time.sleep(interval)
-        # This loop performs filesystem reads only. A new report explicitly refreshes Slurm.
+        # Filesystem reads only; Slurm is queried once.
         report["generated_at"] = utc_now()
         report["runs"] = history.refresh()
 

@@ -223,6 +223,157 @@ for(let click=0;click<4;click++){
         self.assertIn('aria-hidden="true" focusable="false"><rect', jobplot.HTML)
         self.assertIn('<aside id="sidebar">', jobplot.HTML)
 
+    @unittest.skipUnless(shutil.which("node"), "node is needed for the 24-hour window regression")
+    def test_long_history_shows_one_day_and_keys_scroll_the_window(self):
+        hour = 3600 * 1000
+
+        def point(index):
+            cpu = 180.0 if index == 3 else 50.0
+            return {"time": index * hour, "cpu": cpu, "average": 50.0, "maximum": 180.0 if index >= 3 else 50.0,
+                    "memory": 2.0, "memory_peak": 2.0, "samples": index + 1, "final": False, "gap": False,
+                    "scope": "process_tree_pgid", "stream_id": "node1--a", "interval": 3600}
+
+        points = [point(index) for index in range(73)]
+        run = {"run_id": RUN_ID, "job_name": "synthetic simulation", "metadata": metadata(), "exit_code": None,
+               "expected_nodes": ["node1"], "expected_node_count": 1,
+               "runtime": {"source": "slurm", "seconds": 1, "display": "0:01"},
+               "nodes": [{"node": "node1", "scopes": ["process_tree_pgid"], "points": points}]}
+        job = {"job_id": JOB_ID, "runs": [run], "diagnostics": [], "scope_notes": {}, "live": True,
+               "connection": "Live", "scheduler": {"queue": []}, "version": 1}
+        second = dict(job, job_id="456_2", version=1)
+        fixture = self.base / "long.json"
+        fixture.write_text(json.dumps({"live": True, "jobs": [job, second]}))
+        script = self.base / "dashboard.js"
+        script.write_text(jobplot.HTML.split('<script>\n"use strict";', 1)[1].split("</script>", 1)[0])
+        javascript = r"""
+const fs=require("node:fs"),vm=require("node:vm"),assert=require("node:assert/strict");
+const elements={},connections=[],listeners={};
+class Element{
+ constructor(tag){this.tag=tag;this.attrs={};this.children=[];this.dataset={};this.value="";this.textContent="";
+  this.hidden=false;this.style={setProperty(){}};this.classList={toggle(){}};}
+ set id(value){this._id=value;elements[value]=this;}get id(){return this._id;}
+ setAttribute(key,value){this.attrs[key]=value;}removeAttribute(key){delete this.attrs[key];}
+ appendChild(child){child.parentElement=this;this.children.push(child);
+  if(this.tag==="select" && this.value==="")this.value=String(child.value);}
+ replaceChildren(){this.children=[];this.value="";}
+ remove(){this.parentElement.children=this.parentElement.children.filter(child=>child!==this);delete elements[this.id];}
+ focus(){document.activeElement=this;}querySelector(){return null;}
+ cloneNode(){return new Element("svg");}
+}
+for(const id of ["data","run","node","axis","title","runtime","connection","context","scheduler","scope",
+ "diagnostics","notice","cpu","memory","cpu-reading","memory-reading","cpu-legend","memory-legend",
+ "sidebar","sidebar-toggle","job-tabs","job-panel","export-status","completion","window"]){
+ const item=new Element(["run","node","axis"].includes(id)?"select":"div");item.id=id;
+}
+elements.sidebar.parentElement=new Element("main");elements.axis.value="elapsed";
+const initial=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+elements.data.textContent=JSON.stringify(initial);
+const saves=["cpu","memory"].map(id=>({dataset:{save:id}}));
+const document={getElementById:id=>elements[id],createElement:tag=>new Element(tag),
+ createElementNS:(_ns,tag)=>new Element(tag),querySelectorAll:()=>saves,
+ querySelector:selector=>saves.find(button=>selector.includes('"'+button.dataset.save+'"'))};
+const context={document,window:{addEventListener:(type,callback)=>listeners[type]=callback},
+ EventSource:class{constructor(){connections.push(this);}close(){}},
+ XMLSerializer:class{serializeToString(svg){return JSON.stringify({
+  paths:svg.children.filter(child=>child.tag==="path").map(child=>child.attrs),
+  labels:svg.children.filter(child=>child.tag==="text").map(child=>child.textContent)});}},
+ TextEncoder,Uint8Array,DataView,Blob};
+vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[2],"utf8"),context);
+const press=(key,extra={})=>{let claimed=false;
+ listeners.keydown({key,ctrlKey:false,shiftKey:false,altKey:false,metaKey:false,...extra,
+                    preventDefault(){claimed=true;}});return claimed;};
+const ctrl=key=>press(key,{ctrlKey:true});
+const labels=(id="cpu")=>elements[id].children.filter(child=>child.tag==="text").map(child=>child.textContent);
+const ticks=()=>labels().filter(text=>/^\d+:\d\d:\d\d$/.test(text));
+const scale=()=>labels().filter(text=>text.endsWith("%"));
+const message=()=>elements.window.textContent;
+const pathX=()=>Array.from(elements.cpu.children.find(child=>child.tag==="path").attrs.d
+ .matchAll(/[ML]([-\d.]+),/g),match=>Number(match[1]));
+
+// A long history opens on the newest day, and says what it is hiding.
+assert.deepEqual(ticks(),["48:00:00","54:00:00","60:00:00","66:00:00","72:00:00"]);
+assert.match(message(),/newest 24 hours of 72:00:00/);assert.equal(elements.window.hidden,false);
+const opening=scale();
+assert.ok(opening.includes("198%"),"the scale comes from the whole run, including the old 180% spike");
+const path=elements.cpu.children.find(child=>child.tag==="path");
+assert.equal(path.attrs["clip-path"],"url(#cpu-plot)");
+assert.ok(elements.cpu.children.some(child=>child.tag==="clipPath"));
+assert.ok(pathX().length<=27,"only the window and one neighbour each side are drawn");
+
+// Inspecting holds the window, then h/l unfold what lies beyond its edge.
+assert.equal(press("h"),true);
+assert.match(elements["cpu-reading"].textContent,/^72:00:00/);
+for(let index=0;index<24;index++)press("h");
+assert.match(elements["cpu-reading"].textContent,/^48:00:00/);
+assert.equal(ticks()[0],"48:00:00","the edge sample is still on screen");
+press("h");
+assert.match(elements["cpu-reading"].textContent,/^47:00:00/);
+assert.deepEqual([ticks()[0],ticks()[4]],["47:00:00","71:00:00"],"one step past the edge moves the window one step");
+assert.match(message(),/Showing 47:00:00 to 71:00:00 of 72:00:00/);
+assert.deepEqual(scale(),opening,"scrolling never rescales");
+for(let index=0;index<24;index++)press("l");
+assert.match(elements["cpu-reading"].textContent,/^71:00:00/);
+assert.equal(ticks()[0],"47:00:00","moving back across the window leaves it still");
+press("l");press("l");
+assert.deepEqual([ticks()[0],ticks()[4]],["48:00:00","72:00:00"],"it stops at the newest sample");
+
+// Ctrl moves a quarter of the window at a time, far faster than a sample.
+press("Escape");
+assert.match(message(),/newest 24 hours/);assert.equal(elements["cpu-reading"].textContent,"Hover or tap to inspect.");
+assert.equal(ctrl("h"),true,"the page must claim Ctrl-h from the browser");
+assert.match(elements["cpu-reading"].textContent,/^66:00:00/);
+assert.equal(ctrl("l"),true,"the page must claim Ctrl-l from the browser");
+assert.match(elements["cpu-reading"].textContent,/^72:00:00/);
+for(let index=0;index<20;index++)ctrl("h");
+assert.match(elements["cpu-reading"].textContent,/^0:00:00/);
+assert.deepEqual([ticks()[0],ticks()[4]],["0:00:00","24:00:00"],"it stops at the first sample");
+press("L");
+assert.match(elements["cpu-reading"].textContent,/^1:00:00/,"H/L move 5% of the window, here one sample");
+
+// Other shortcuts stay the browser's.
+press("Escape");
+for(const [key,extra] of [["l",{ctrlKey:true,shiftKey:true}],["l",{altKey:true}],["h",{metaKey:true}],
+                          ["t",{ctrlKey:true}],["x",{}]])
+ assert.equal(press(key,extra),false,key);
+assert.equal(ctrl("L"),false,"Ctrl-Shift-L is not claimed");
+
+// A live sample does not disturb an inspected window; the newest view does follow it.
+ctrl("h");ctrl("h");
+const held=ticks();
+const grown=JSON.parse(JSON.stringify(initial));
+for(const item of grown.jobs){item.version=2;
+ const list=item.runs[0].nodes[0].points;list.push({...list[list.length-1],time:list[list.length-1].time+3600000});}
+connections[0].onmessage({data:JSON.stringify(grown)});
+assert.deepEqual(ticks(),held,"a held window stays put");
+assert.match(elements["cpu-reading"].textContent,/^60:00:00/,"the reading survives a live redraw");
+press("Escape");
+assert.deepEqual([ticks()[0],ticks()[4]],["49:00:00","73:00:00"]);
+
+// Exports always hold the whole run, whatever is on screen.
+ctrl("h");ctrl("h");
+const svg=JSON.parse(vm.runInContext('exportFiles("cpu")',context).files[0][1]);
+assert.equal(svg.labels.filter(text=>/^\d+:\d\d:\d\d$/.test(text))[0],"0:00:00");
+assert.ok(svg.paths.every(attrs=>!attrs["clip-path"]));
+assert.ok(svg.paths[0].d.split(/[ML]/).length>70,"the image holds every sample");
+assert.deepEqual(ticks().length,5);
+
+// Choosing another job starts it on its newest day.
+elements["job-tab-456_2"].onclick();
+assert.match(message(),/newest 24 hours/);assert.equal(elements["cpu-reading"].textContent,"Hover or tap to inspect.");
+
+// A history inside one day is drawn whole, with no window summary.
+for(const item of grown.jobs){item.version=3;item.runs[0].nodes[0].points=item.runs[0].nodes[0].points.slice(0,20);}
+connections[0].onmessage({data:JSON.stringify(grown)});
+assert.equal(message(),"");assert.equal(elements.window.hidden,true);
+assert.equal(ticks()[0],"0:00:00");
+assert.ok(!elements.cpu.children.some(child=>child.tag==="clipPath"));
+press("h");press("h");
+assert.match(elements["cpu-reading"].textContent,/^18:00:00/);
+"""
+        result = subprocess.run(["node", "-e", javascript, str(fixture), str(script)],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr[-1500:])
+
     @unittest.skipUnless(shutil.which("node"), "node is needed for the job tabs regression")
     def test_job_tabs_preserve_views_live_elapsed_and_selected_job_exports(self):
         meta = dict(metadata(), expected_nodes=["node1", "node2"], expected_node_count=2,
@@ -269,7 +420,7 @@ class Element{
 }
 for(const id of ["data","run","node","axis","title","runtime","connection","context","scheduler","scope",
  "diagnostics","notice","cpu","memory","cpu-reading","memory-reading","cpu-legend","memory-legend",
- "sidebar","sidebar-toggle","job-tabs","job-panel","export-status","completion"]){
+ "sidebar","sidebar-toggle","job-tabs","job-panel","export-status","completion","window"]){
  const item=new Element(["run","node","axis"].includes(id)?"select":"div");item.id=id;
 }
 elements.sidebar.parentElement=new Element("main");elements.axis.value="clock";
@@ -417,7 +568,8 @@ assert.equal(connections.length,1);listeners.pagehide();assert.equal(connections
         # Exercise the actual click handler and ZIP writer without requiring a GUI.
         code = ("function crc32(bytes){"
                 + jobplot.HTML.split("function crc32(bytes){", 1)[1].split("update(data);", 1)[0])
-        export_script.write_text("const exportSpec=" + json.dumps(jobplot.EXPORT_SPEC) + ";\n" + code)
+        export_script.write_text("const exportSpec=" + json.dumps(jobplot.EXPORT_SPEC) + ";\nconst WINDOW_MS="
+                                 + str(jobplot.CHART_WINDOW_MS) + ";\n" + code)
         javascript = r"""
 const fs=require("node:fs"),vm=require("node:vm");
 const data=JSON.parse(fs.readFileSync(process.argv[1],"utf8")), downloads=[],blobs=[];

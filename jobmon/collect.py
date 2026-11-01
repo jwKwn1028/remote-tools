@@ -88,7 +88,6 @@ def read_json(path):
 
 
 def verify_storage_probe(root=None):
-    """Verify that a probe created on the login node is visible here."""
     root = private_directory(root or data_root())
     path = root / STORAGE_PROBE_FILE
     try:
@@ -111,7 +110,6 @@ def verify_storage_probe(root=None):
 
 
 def initialize_storage_probe(root=None, allow_allocation=False):
-    """Create the login-side marker later required from allocation nodes."""
     if os.environ.get("SLURM_JOB_ID") and not allow_allocation:
         raise JobmonError("Initialize shared storage from the login node, outside a Slurm allocation.")
     root = private_directory(root or data_root(), create=True)
@@ -186,10 +184,9 @@ def initialize(root=None, runner=run_command, run_id=None, attachment=None):
     try:
         cpus = expand_cpu_counts(os.environ.get("SLURM_JOB_CPUS_PER_NODE"))
     except JobmonError as exc:
-        # Keep collecting when allocation details are unavailable.
         cpus = []
         errors.append(str(exc))
-    # Invalid CPU maps would make the entire run unreadable by load_run.
+    # Reject CPU maps that load_run cannot read.
     cpu_map = {}
     if nodes and len(nodes) == len(cpus) and all(count >= 1 for count in cpus):
         cpu_map = dict(zip(nodes, cpus))
@@ -281,7 +278,7 @@ def monitoring_active(job_id, root=None, include_reservation=True):
 
 
 def recent_samples(run, metadata, now=None):
-    """Also detect collectors when advisory locks are not visible across hosts."""
+    """Check fresh samples when cross-host locks fail."""
     now = time.time() if now is None else now
     for path in run.glob("*.jsonl"):
         with private_open(path, os.O_RDONLY) as stream:
@@ -369,7 +366,7 @@ def unescape_mount(value):
 
 
 def discover_cgroup(raw_job_id, proc=Path("/proc/self")):
-    """Select only a visible job_<raw ID> ancestor of this process's cgroup."""
+    """Find this process's job_<raw ID> cgroup ancestor."""
     validate_job_id(raw_job_id)
     try:
         lines = (proc / "cgroup").read_text().splitlines()
@@ -402,12 +399,10 @@ def discover_cgroup(raw_job_id, proc=Path("/proc/self")):
 
 
 PROCESS_TREE_SCOPE = "process_tree_pgid"
-# Launchers whose real work runs in a separate Slurm step, outside this group.
 SEPARATE_STEP_LAUNCHERS = ("srun", "mpirun", "mpiexec", "orterun")
 
 
 def discover_process_group(env=None):
-    """Opt-in process-group scope for sites where Slurm creates no job cgroup."""
     env = os.environ if env is None else env
     if env.get("JOBMON_PROCESS_TREE") != "1":
         return None, ("process-tree sampling is off; set JOBMON_PROCESS_TREE=1 only where "
@@ -419,23 +414,19 @@ def discover_process_group(env=None):
 
 
 def read_process_stat(pid, proc=Path("/proc")):
-    """Return (process group, CPU ticks, RSS pages, command) from /proc/<pid>/stat.
-
-    The command field is parenthesized and may itself contain spaces and
-    parentheses, so every numeric field is taken after its final ')'.
-    """
+    """Return (PGID, CPU ticks, RSS pages, command); allow ')' in commands."""
     content = (proc / str(pid) / "stat").read_text()
     end = content.rindex(")")
     command = content[content.index("(") + 1:end]
-    # This slice starts at field 3 (state), so proc(5) field N is at index N - 3.
+    # Fields start at proc(5) field 3.
     fields = content[end + 2:].split()
-    # utime, stime, cutime, cstime: reaped descendants keep the total monotonic.
+    # utime, stime, cutime, cstime.
     ticks = sum(int(fields[index]) for index in (11, 12, 13, 14))
     return int(fields[2]), ticks, int(fields[21]), command
 
 
 def process_tree_sample(pgid, proc=Path("/proc"), exclude=()):
-    """Sum CPU and RSS across one process group; an approximation, not a cgroup."""
+    """Approximate process-group CPU/RSS; not a cgroup measurement."""
     result = {"scope": PROCESS_TREE_SCOPE, "cpu_seconds": None, "memory_bytes": None,
               "memory_peak_bytes": None, "counted_processes": 0, "errors": []}
     try:
@@ -452,7 +443,7 @@ def process_tree_sample(pgid, proc=Path("/proc"), exclude=()):
         try:
             group, process_ticks, process_pages, command = read_process_stat(pid, proc)
         except (OSError, ValueError, IndexError):
-            continue  # The process exited between listing and reading; skip it.
+            continue
         if group != pgid:
             continue
         result["counted_processes"] += 1
@@ -491,7 +482,6 @@ def cgroup_sample(path):
 
 
 def gpus_allocated(env):
-    """True when Slurm or CUDA shows GPUs on this node; never which ones are the job's."""
     if number(env.get("SLURM_GPUS_ON_NODE")):
         return True
     for name in ("SLURM_JOB_GPUS", "SLURM_STEP_GPUS", "CUDA_VISIBLE_DEVICES"):
@@ -513,7 +503,6 @@ class NvidiaSampler:
         self.enabled = True
         self.exclusive = False
         if not self.uuids:
-            # GPU collection is off without a mapping; warn only if GPUs are allocated.
             if gpus_allocated(env):
                 self.reason = ("no verified GPU UUID mapping; set JOBMON_GPU_UUIDS per node after "
                                "checking allocation ownership")
@@ -578,7 +567,7 @@ def sample_metrics(cgroup, cgroup_error, cpus, previous, tick, process_group=Non
     if cgroup:
         metrics = cgroup_sample(cgroup)
     elif process_group is not None:
-        # Never measure the collector itself; skipping it also drops its reaped children.
+        # Exclude collector CPU and reaped children.
         metrics = process_tree_sample(process_group, exclude=(os.getpid(),))
     else:
         metrics = {"scope": "unavailable", "cpu_seconds": None, "memory_bytes": None,
@@ -617,11 +606,7 @@ def stop_requested(run_dir, stop):
 
 
 def wait_for_next_sample(run_dir, stop, deadline, poll=STOP_POLL_SECONDS, target=None):
-    """Wait responsively so a stop marker still produces one final sample.
-
-    Signals set the event directly, so only the shared-storage marker is polled;
-    a short interval still bounds each wait by its own remaining time.
-    """
+    """Signals set stop; poll only the shared marker."""
     while time.monotonic() < deadline and not stop.is_set():
         if target is not None and not target.alive():
             stop.set()
@@ -661,13 +646,12 @@ def collect(run_dir, interval=60, once=False, stop=None, target=None):
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise JobmonError("A collector is already running on node " + node) from exc
-        # A restarted collector gets a separate stream; counters are never spliced.
         stream_id = node + "--" + uuid.uuid4().hex[:12]
         with private_open(run_dir / (stream_id + ".jsonl"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, "w") as stream:
             previous = None
             while True:
                 tick = time.monotonic()
-                # CPU/memory alignment uses capture time, before a possibly slow GPU query.
+                # Timestamp before slow GPU queries.
                 timestamp = utc_now()
                 if target is not None and not target.alive():
                     stop.set()
@@ -687,7 +671,6 @@ def collect(run_dir, interval=60, once=False, stop=None, target=None):
                     break
                 if stop_requested(run_dir, stop):
                     continue
-                # Check the stop marker promptly without collecting or calling Slurm.
                 if target is None:
                     wait_for_next_sample(run_dir, stop, tick + interval)
                 else:
@@ -715,7 +698,7 @@ def attach_collect(request, stop):
     if os.environ.get("SLURM_JOB_NUM_NODES", os.environ.get("SLURM_NNODES", "")) != "1":
         raise JobmonError("Attachment currently supports single-node batch jobs only.")
     target = batch_process(job_id, raw)
-    # Old Slurm steps may omit array variables; the original batch identity is verified above.
+    # Legacy steps may omit array variables.
     if "_" in job_id and current == raw:
         os.environ["SLURM_ARRAY_JOB_ID"], os.environ["SLURM_ARRAY_TASK_ID"] = job_id.split("_", 1)
     cgroup, reason = discover_cgroup(raw)

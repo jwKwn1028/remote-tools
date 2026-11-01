@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Preview by default; --apply installs over SSH, or in this account with --local.
+# Preview; --apply installs via SSH or --local.
 set -euo pipefail
 
 apply=0
@@ -39,7 +39,6 @@ for source_file in "${sources[@]}"; do
 done
 command -v sha256sum >/dev/null || { printf 'sha256sum is required for verified deployment.\n' >&2; exit 2; }
 ssh_options=(-T -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1)
-# Use the same fixed install script locally and over SSH.
 run_target() {
     if (( install_here )); then
         sh -c "$1"
@@ -56,7 +55,6 @@ if (( ! apply )); then
     printf 'Preview only. Add --apply to copy these files.\n'
     exit 0
 fi
-# Stage checksummed sources; validate the full release before switching current.
 local_staging=$(mktemp -d)
 cleanup_local() {
     rm -f -- "$local_staging/jobmon.py" "$local_staging/slurm_backend.py" \
@@ -75,7 +73,7 @@ done
     sha256sum "${release_files[@]}" > SHA256SUMS
 )
 
-# Send only fixed sources and checksums; never turn arguments into remote code.
+# Send fixed files; arguments never become remote code.
 # shellcheck disable=SC2016
 install_script='
 set -eu
@@ -112,7 +110,7 @@ chmod 700 "$staging/monitored-job.sh"
 (cd "$staging" && sha256sum -c SHA256SUMS)
 bash -n "$staging/monitored-job.sh"
 
-# Refuse unrelated wrapper paths; migrate only byte-identical manual copies.
+# Migrate only identical manual wrappers.
 if [ -L "$wrapper" ]; then
     [ "$(readlink "$wrapper")" = "$wrapper_target" ] || {
         printf "jobmon deploy: refusing unrelated wrapper symlink: %s\n" "$wrapper" >&2; exit 1;
@@ -123,7 +121,6 @@ elif [ -e "$wrapper" ]; then
         exit 1
     fi
 fi
-# Apply the same policy to Python entry points.
 for file in current slurm_backend.py collect.py jobmon.py; do
     target="$base/$file"
     if [ -L "$target" ]; then
@@ -173,17 +170,14 @@ else
     staging=""
 fi
 
-# Keep existing bin directory permissions; only the installed wrapper is private.
 chmod 700 "$release/monitored-job.sh"
-# Initialize current before creating entry points on first install.
-# Upgrades activate atomically at the final switch below.
+# Create current before entry points on first install.
 if [ ! -e "$base/current" ]; then
     next_link="$base/.current.$$"
     ln -s "releases/$release_id" "$next_link"
     mv -fT -- "$next_link" "$base/current"
     next_link=""
 fi
-# Set up stable entry points first, then switch the complete release with current.
 for file in slurm_backend.py collect.py jobmon.py; do
     next_link="$base/.${file}.link.$$"
     ln -s "current/$file" "$next_link"

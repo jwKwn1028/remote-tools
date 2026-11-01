@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a fetched jobmon archive as a private, standalone HTML time plot."""
+"""Standalone HTML plots from private jobmon archives."""
 
 import argparse
 import datetime as dt
@@ -21,6 +21,7 @@ from slurm_backend import JobmonError, validate_job_id
 
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 MAX_MEMBERS = 10000
+CHART_WINDOW_MS = 24 * 3600 * 1000
 EXPORT_SPEC = {
     "series": {
         "cpu": [["cpu", "Last interval", "#7aa2f7"], ["average", "Average", "#ff9e64"],
@@ -68,7 +69,7 @@ def csv_cell(value):
 
 
 def svg_chart(chart, points, axis="elapsed"):
-    """Workstation SVG counterpart of the browser renderer, using the same series."""
+    """SVG renderer using the browser's series."""
     root = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg", "id": chart, "width": "1000", "height": "280",
                               "viewBox": "0 0 1000 280", "role": "img",
                               "aria-label": "CPU history" if chart == "cpu" else "Memory history"})
@@ -165,16 +166,17 @@ def export_files(data, run, node, chart, captured=None, axis="elapsed", timezone
     return filename, files
 
 
-def write_exports(data, destination):
+def write_exports(data, destination, selections=None, axis="elapsed"):
     validate_job_id(data["job_id"])
-    selections = [(run, node) for run in data["runs"] for node in run["nodes"] if node["points"]]
+    if selections is None:
+        selections = [(run, node) for run in data["runs"] for node in run["nodes"] if node["points"]]
     if not selections:
         raise JobmonError("No saved samples to export; the job must have used the opt-in collector.")
     directory = private_directory(destination, create=True)
     outputs = []
     for run, node in selections:
         for chart in EXPORT_SPEC["series"]:
-            filename, files = export_files(data, run, node, chart)
+            filename, files = export_files(data, run, node, chart, axis=axis)
             path = directory / filename
             fd, temporary = tempfile.mkstemp(prefix=".jobmon-", suffix=".zip.partial", dir=str(directory))
             try:
@@ -198,7 +200,7 @@ def warning(errors, message):
 
 
 def metadata_for_plot(value, job_id, run_id):
-    # Validate local ownership separately; preserve the saved cluster UID/user.
+    # Check local ownership; preserve cluster UID/user.
     if (not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION
             or value.get("job_id") != job_id or value.get("run_id") != run_id):
         raise JobmonError("Archive metadata does not match the requested job/run.")
@@ -227,7 +229,7 @@ def read_archive(job_id, path):
     validate_job_id(job_id)
     runs, seen, errors = {}, set(), set()
     total = 0
-    # Inspect members directly: no archive paths are ever extracted to disk.
+    # Read members without extracting.
     with private_open(path, os.O_RDONLY) as local, tarfile.open(fileobj=local.buffer, mode="r|gz") as archive:
         for index, member in enumerate(archive):
             total += member.size
@@ -331,20 +333,42 @@ def plot_data(job_id, runs, errors):
                          "scope_notes": MEMORY_SCOPE_NOTES})
 
 
+def completion_result(job_id, run, queue_status, latest=True):
+    """Match the page's completionResult evidence rules."""
+    if run is not None and type(run.get("exit_code")) is int:
+        code = run["exit_code"]
+        detail = "Batch wrapper result for the selected run. Use hpc-jreport {} for final Slurm state.".format(job_id)
+        if code == 0:
+            return {"kind": "finished", "label": "finished", "message": "Workload finished (exit 0).",
+                    "detail": detail}
+        return {"kind": "failed", "label": "exit {}".format(code), "detail": detail,
+                "message": "Workload exited with code {}. Check the job's output/error logs.".format(code)}
+    if queue_status is None or queue_status["state"] is not None or not latest:
+        return None
+    metadata = (run or {}).get("metadata") or {}
+    checked = timestamp_seconds(queue_status["checked_at"])
+    created = timestamp_seconds(metadata.get("created_at"))
+    if checked is None or (created is not None and created > checked):
+        return None
+    detail = ("Attached monitoring cannot record the workload's exit code." if metadata.get("attachment")
+              else "No workload exit code was recorded by this monitor.")
+    return {"kind": "unknown", "label": "left queue", "message": "Job left the Slurm queue.", "detail": detail}
+
+
 def with_runtime(data):
-    """Attach elapsed time through each run's latest saved sample, never wall-clock now."""
+    """Elapsed through saved samples, never wall-clock now."""
     report = dict(data, scheduler=data.get("scheduler") or {"queue": []},
                   scheduler_snapshot_at=data.get("scheduler_snapshot_at"))
     snapshot = timestamp_seconds(report["scheduler_snapshot_at"])
     if snapshot is not None:
-        # Runs created after this snapshot must not displace its allocation.
+        # Ignore runs created after this snapshot.
         report["runs"] = [run for run in data["runs"]
                           if (timestamp_seconds(run["metadata"].get("created_at")) or 0) <= snapshot + 60]
     runs = []
     for run in data["runs"]:
         source, start = run_start(report, run)
         created = timestamp_seconds(run["metadata"].get("created_at"))
-        # A requeue first seen after the initial snapshot cannot inherit its start.
+        # Later requeues cannot inherit the initial start.
         if source == "slurm" and created > snapshot + 60:
             source, start = "monitoring", created
         bounds = [(node["points"][0]["time"], node["points"][-1]["time"])
@@ -412,7 +436,8 @@ small{font-size:11px;color:var(--muted)}.legend{font-size:12px;display:flex;gap:
 .legend span::before{content:"";display:inline-block;width:18px;height:3px;background:var(--color);
 vertical-align:middle;margin-right:6px}details{margin-top:20px}summary{cursor:pointer;color:var(--magenta)}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 ui-monospace,monospace;color:var(--fg-dim)}
-#scheduler{font-size:11px;color:var(--muted)}@media(max-width:760px){
+#scheduler{font-size:11px;color:var(--muted)}#window{font-size:12px;color:var(--fg-dim);margin:0 0 12px}
+@media(max-width:760px){
 main{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}
 .controls{grid-template-columns:repeat(3,minmax(0,1fr))}.charts{padding:12px}header{gap:12px;flex-wrap:wrap}}
 </style>
@@ -436,6 +461,7 @@ aria-hidden="true" focusable="false"><rect x="3" y="3" width="18" height="18" rx
 <details><summary>Diagnostics</summary><pre id="diagnostics"></pre></details>
 </aside><div class="charts">
 <p id="completion" role="status" aria-live="polite" hidden></p>
+<p id="window" hidden></p>
 <section><h2>CPU · % of allocated cores</h2><div class="legend" id="cpu-legend"></div>
 <svg id="cpu" width="1000" height="280" viewBox="0 0 1000 280" role="img" aria-label="CPU history"></svg>
 <output id="cpu-reading">Hover or tap to inspect.</output>
@@ -468,14 +494,40 @@ function element(tag,attrs,text){
 function option(select,value,text){
  const el=document.createElement("option");el.value=value;el.textContent=text;select.appendChild(el);
 }
-function labelTime(time,first){
- if(byId("axis").value==="clock")return new Date(time).toLocaleString();
- const seconds=Math.max(0,Math.round((time-first)/1000));
+function elapsedText(milliseconds){
+ const seconds=Math.max(0,Math.round(milliseconds/1000));
  return Math.floor(seconds/3600)+":"+String(Math.floor(seconds/60)%60).padStart(2,"0")+":"+
         String(seconds%60).padStart(2,"0");
 }
-function chart(id,points){
- const svg=byId(id), specs=series[id], left=74,right=970,top=16,bottom=236;
+function labelTime(time,first){
+ if(byId("axis").value==="clock")return new Date(time).toLocaleString();
+ return elapsedText(time-first);
+}
+const WINDOW_MS=__JOBMON_WINDOW_MS__;
+let inspect=null, windowEnd=null;
+function chartSpan(points){
+ const first=points[0].time,last=points[points.length-1].time;
+ if(last-first<=WINDOW_MS)return [first,last];
+ const end=windowEnd===null?last:Math.max(first+WINDOW_MS,Math.min(last,windowEnd));
+ return [end-WINDOW_MS,end];
+}
+function firstAtOrAfter(points,time){
+ let low=0,high=points.length;
+ while(low<high){const middle=Math.floor((low+high)/2);if(points[middle].time<time)low=middle+1;else high=middle;}
+ return low;
+}
+function nearestIndex(points,time){
+ let low=Math.min(points.length-1,firstAtOrAfter(points,time));
+ if(low>0 && Math.abs(points[low-1].time-time)<Math.abs(points[low].time-time))low--;
+ return low;
+}
+function readingText(id,points,point){
+ return labelTime(point.time,points[0].time)+(point.final?" · final sample":"")+"\\n"+
+  series[id].map(([key,label])=>label+": "+(point[key]===null?"unavailable":point[key].toFixed(2)+
+             (id==="cpu"?"%":" GiB"))).join("   ");
+}
+function chart(id,points,svg=byId(id),span=null){
+ const specs=series[id], left=74,right=970,top=16,bottom=236;
  svg.replaceChildren();svg.onpointermove=null;svg.onpointerleave=null;
  svg.appendChild(element("rect",{width:1000,height:280,fill:"#1d202f"}));
  const style=element("style",{},"text{font:11px ui-monospace,monospace;fill:#a9b1d6}");
@@ -483,20 +535,21 @@ function chart(id,points){
  if(!points.length){
   svg.appendChild(element("text",{x:500,y:120,"text-anchor":"middle"},"Waiting for saved samples"));return;
  }
- const first=points.length?points[0].time:0,last=points.length?points[points.length-1].time:first;
- const range=Math.max(1000,last-first);
+ const first=points[0].time,last=points[points.length-1].time,[start,end]=span||chartSpan(points);
+ const range=Math.max(1000,end-start), windowed=start>first||end<last;
+ // Whole-run scale: scrolling must not rescale.
  let maximum=id==="cpu"?100:0;
  for(const point of points)for(const [key] of specs)if(point[key]!==null)maximum=Math.max(maximum,point[key]);
  maximum=id==="cpu" && maximum===100?100:maximum>0?maximum*1.1:1;
- const x=time=>left+(time-first)/range*(right-left), y=value=>bottom-value/maximum*(bottom-top);
+ const x=time=>left+(time-start)/range*(right-left), y=value=>bottom-value/maximum*(bottom-top);
  for(let tick=0;tick<=4;tick++){
   const value=maximum*tick/4, py=y(value), px=left+(right-left)*tick/4;
   svg.appendChild(element("line",{x1:left,x2:right,y1:py,y2:py,stroke:"#343a55"}));
   const label=Number(value.toPrecision(3))+(id==="cpu"?"%":"");
   svg.appendChild(element("text",{x:left-10,y:py+4,"text-anchor":"end"},label));
-  const stamp=first+(last-first)*tick/4;
+  const stamp=start+(end-start)*tick/4;
   let text=labelTime(stamp,first);
-  if(byId("axis").value==="clock" && last-first<86400000)text=new Date(stamp).toLocaleTimeString();
+  if(byId("axis").value==="clock" && end-start<86400000)text=new Date(stamp).toLocaleTimeString();
   svg.appendChild(element("text",{x:px,y:bottom+28,"text-anchor":tick===0?"start":tick===4?"end":"middle"},text));
  }
  if(id==="cpu"){
@@ -506,35 +559,74 @@ function chart(id,points){
   if(maximum>100)svg.appendChild(element("text",{x:right-6,y:Math.max(top+14,py-6),
    "text-anchor":"end"},"100%"));
  }
+ if(windowed){
+  const clip=element("clipPath",{id:id+"-plot"});
+  clip.appendChild(element("rect",{x:left,y:top-4,width:right-left,height:bottom-top+8}));
+  svg.appendChild(clip);
+ }
+ const shown=windowed?points.slice(Math.max(0,firstAtOrAfter(points,start)-1),
+                                   firstAtOrAfter(points,end+1)+1):points;
  for(const [key,,color] of specs){
   let path="",pen=false;
-  for(const point of points){
+  for(const point of shown){
    if(point.gap || point[key]===null)pen=false;
    if(point[key]===null)continue;
    path+=(pen?"L":"M")+x(point.time).toFixed(2)+","+y(point[key]).toFixed(2)+(pen?"":"l0,0");
    pen=true;
   }
-  svg.appendChild(element("path",{d:path,fill:"none",stroke:color,"stroke-width":2,"stroke-linecap":"round"}));
+  svg.appendChild(element("path",{d:path,fill:"none",stroke:color,"stroke-width":2,"stroke-linecap":"round",
+   ...(windowed?{"clip-path":"url(#"+id+"-plot)"}:{})}));
  }
  if(!points.some(point=>specs.some(([key])=>point[key]!==null)))
   svg.appendChild(element("text",{x:500,y:120,"text-anchor":"middle"},"No available measurements"));
  const cursor=element("line",{x1:left,x2:left,y1:top,y2:bottom,stroke:"#737aa2",
                              "stroke-dasharray":"3 3",visibility:"hidden"});
  svg.appendChild(cursor);
+ const place=time=>{
+  const px=Math.max(left,Math.min(right,x(time)));
+  cursor.setAttribute("x1",px);cursor.setAttribute("x2",px);cursor.setAttribute("visibility","visible");
+ };
+ const rest=()=>{
+  if(inspect===null){cursor.setAttribute("visibility","hidden");return;}
+  place(inspect);byId(id+"-reading").textContent=readingText(id,points,points[nearestIndex(points,inspect)]);
+ };
+ if(inspect!==null)place(inspect);
  svg.onpointermove=event=>{
   if(!points.length)return;
   const relative=(event.clientX-svg.getBoundingClientRect().left)/svg.getBoundingClientRect().width*1000;
-  const time=first+(relative-left)/(right-left)*range;
-  let low=0,high=points.length-1;
-  while(low<high){const middle=Math.floor((low+high)/2);if(points[middle].time<time)low=middle+1;else high=middle;}
-  if(low>0 && Math.abs(points[low-1].time-time)<Math.abs(points[low].time-time))low--;
-  const point=points[low], px=x(point.time);
-  cursor.setAttribute("x1",px);cursor.setAttribute("x2",px);cursor.setAttribute("visibility","visible");
-  byId(id+"-reading").textContent=labelTime(point.time,first)+(point.final?" · final sample":"")+"\\n"+
-   specs.map(([key,label])=>label+": "+(point[key]===null?"unavailable":point[key].toFixed(2)+
-              (id==="cpu"?"%":" GiB"))).join("   ");
+  const point=points[nearestIndex(points,start+(relative-left)/(right-left)*range)];
+  place(point.time);byId(id+"-reading").textContent=readingText(id,points,point);
  };
- svg.onpointerleave=()=>cursor.setAttribute("visibility","hidden");
+ svg.onpointerleave=rest;
+}
+function windowText(points){
+ if(!points.length)return "";
+ const first=points[0].time,last=points[points.length-1].time;
+ if(last-first<=WINDOW_MS)return "";
+ const total=elapsedText(last-first), [start,end]=chartSpan(points);
+ if(inspect===null)return "Showing the newest 24 hours of "+total+". h starts inspecting; Ctrl-h jumps back.";
+ return "Showing "+labelTime(start,first)+" to "+labelTime(end,first)+" of "+total+
+  ". h/l move one sample, H/L a step, Ctrl-h/Ctrl-l a tick. Esc returns to the newest.";
+}
+function clearInspect(){inspect=null;windowEnd=null;}
+function pinWindow(points){
+ const [start,end]=chartSpan(points);
+ windowEnd=inspect<start?inspect+WINDOW_MS:inspect>end?inspect:end;
+}
+function moveInspect(points,direction,fraction){
+ if(!points.length)return;
+ if(inspect===null){
+  inspect=points[points.length-1].time;
+  if(!fraction){pinWindow(points);return;}
+ }
+ const [start,end]=chartSpan(points), index=nearestIndex(points,inspect);
+ let target=index+direction;
+ if(fraction){
+  const landed=nearestIndex(points,inspect+direction*(end-start)*fraction);
+  target=direction<0?Math.min(landed,target):Math.max(landed,target);
+ }
+ inspect=points[Math.min(points.length-1,Math.max(0,target))].time;
+ pinWindow(points);
 }
 function draw(){
  const run=data.runs[Number(byId("run").value)], node=run?.nodes[Number(byId("node").value)];
@@ -568,13 +660,17 @@ function draw(){
   (snapshot?" at "+new Date(snapshot).toLocaleTimeString():""):"";
  byId("diagnostics").textContent=[...data.diagnostics,...(discoveryError?[discoveryError]:[])].join("\\n")||
   "No recorded diagnostics.";
- if(data.live)byId("notice").textContent="Live saved samples. Hover or tap for values. "+
+ if(data.live)byId("notice").textContent="Live saved samples. Hover or tap for values, or press h and l. "+
   "CPU averages cover sampled intervals only. Missing readings remain gaps. Memory peaks stay per node. "+
   "Closing the last browser tab stops viewing, while workload collection continues.";
  document.title=byId("title").textContent;
+ const points=node?node.points:[], summary=windowText(points);
+ byId("window").textContent=summary;byId("window").hidden=!summary;
  for(const id of Object.keys(series)){
-  chart(id,node?node.points:[]);byId(id+"-reading").textContent="Hover or tap to inspect.";
-  document.querySelector('[data-save="'+id+'"]').disabled=!node?.points.length;
+  chart(id,points);
+  byId(id+"-reading").textContent=inspect!==null && points.length?
+   readingText(id,points,points[nearestIndex(points,inspect)]):"Hover or tap to inspect.";
+  document.querySelector('[data-save="'+id+'"]').disabled=!points.length;
  }
 }
 function selectRun(preferredNode){
@@ -624,7 +720,7 @@ function showJob(){
 }
 function selectJob(jobId){
  if(selectedJob===jobId)return;
- rememberJob();selectedJob=jobId;renderJobTabs();showJob();
+ rememberJob();selectedJob=jobId;clearInspect();renderJobTabs();showJob();
 }
 function renderJobTabs(){
  const tabs=byId("job-tabs"), panel=byId("job-panel");
@@ -666,13 +762,24 @@ function update(next){
  if(!jobs.some(job=>job.job_id===selectedJob))selectedJob=jobs[0].job_id;
  renderJobTabs();
  const selected=jobs.find(job=>job.job_id===selectedJob);
- // Background jobs can update without disturbing the selected chart or hover.
  if(hadSelection && previous.job_id===selectedJob && selected.version!==undefined &&
     previous.version===selected.version && previous.connection===selected.connection &&
     previousError===discoveryError)return;
  showJob();
 }
-byId("run").onchange=()=>selectRun();byId("node").onchange=draw;byId("axis").onchange=draw;
+byId("run").onchange=()=>{clearInspect();selectRun();};
+byId("node").onchange=()=>{clearInspect();draw();};byId("axis").onchange=draw;
+const inspectMoves={h:[-1,0],l:[1,0],H:[-1,1/20],L:[1,1/20]}, inspectJumps={h:[-1,1/4],l:[1,1/4]};
+window.addEventListener("keydown",event=>{
+ if(event.altKey || event.metaKey)return;
+ if(event.key==="Escape"){if(inspect!==null){clearInspect();draw();}return;}
+ const move=event.ctrlKey?(event.shiftKey?null:inspectJumps[event.key]):inspectMoves[event.key];
+ if(!move)return;
+ // Claim Ctrl-h and Ctrl-l from the browser.
+ event.preventDefault();
+ const run=data.runs[Number(byId("run").value)], node=run?.nodes[Number(byId("node").value)];
+ moveInspect(node?node.points:[],move[0],move[1]);draw();
+});
 function toggleSidebar(){
  const sidebar=byId("sidebar"), expanded=sidebar.hidden;
  sidebar.hidden=!expanded;
@@ -694,7 +801,6 @@ function crc32(bytes){
  return (crc^0xffffffff)>>>0;
 }
 function zipFiles(files){
- // Stored ZIP entries keep exports dependency-free, including offline HTML.
  const encoder=new TextEncoder(), parts=[], directory=[];
  let offset=0, directorySize=0;
  const now=new Date(), year=Math.min(2107,Math.max(1980,now.getFullYear()));
@@ -752,19 +858,20 @@ function exportFiles(id){
   csv.push([new Date(point.time).toISOString(),(point.time-first)/1000,point.cpu,point.average,point.maximum,
    point.memory,point.memory_peak,point.samples,point.final,point.gap,scope].map(cell).join(","));
  }
- const svg=byId(id).cloneNode(true);svg.setAttribute("xmlns",ns);svg.querySelector("[visibility]")?.remove();
+ const svg=byId(id).cloneNode(true);svg.setAttribute("xmlns",ns);
+ if(points[points.length-1].time-first>WINDOW_MS)chart(id,points,svg,[first,points[points.length-1].time]);
+ svg.querySelector("[visibility]")?.remove();
  const files=[["chart.svg",new XMLSerializer().serializeToString(svg)],
   ["data.csv",csv.join("\\r\\n")+"\\r\\n"],["data.json",JSON.stringify(snapshot,null,2)+"\\n"]];
  if(raw.length)files.push(["samples.jsonl",raw.join("\\n")+"\\n"]);
  const stamp=captured.replace(/[-:.]/g,"");
- // Byte limits keep Unicode names and the complete filename within filesystem limits.
  const jobName=filenamePart(run.job_name,64), runName=filenamePart(run.run_id,48), nodeName=filenamePart(node.node,32);
  const filename="jobmon-"+data.job_id+"-"+jobName+"-"+runName+"-"+nodeName+"-"+id+"-"+stamp+".zip";
  return {files,filename,complete:snapshot.raw_samples_complete};
 }
 for(const button of document.querySelectorAll("[data-save]"))button.onclick=()=>{
  try{
-  // Capture the rendered SVG and selected data synchronously before a live update.
+  // Capture synchronously, before a live update.
   const result=exportFiles(button.dataset.save), url=URL.createObjectURL(zipFiles(result.files));
   const link=document.createElement("a");link.href=url;link.download=result.filename;link.click();
   setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -782,11 +889,12 @@ if(data.live){
 }
 </script>
 </html>
-""".replace("__JOBMON_EXPORT_SPEC__", json.dumps(EXPORT_SPEC, separators=(",", ":")))
+""".replace("__JOBMON_EXPORT_SPEC__", json.dumps(EXPORT_SPEC, separators=(",", ":"))).replace(
+    "__JOBMON_WINDOW_MS__", str(CHART_WINDOW_MS))
 
 
 def render_html(data):
-    # Escape embedded HTML, including </script>; the renderer uses textContent.
+    # Escape </script>; use textContent when rendering.
     payload = json.dumps(data, ensure_ascii=True, allow_nan=False).replace("<", "\\u003c")
     payload = payload.replace(">", "\\u003e").replace("&", "\\u0026")
     return HTML.replace("__JOBMON_DATA__", payload)

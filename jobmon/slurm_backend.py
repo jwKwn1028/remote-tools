@@ -9,7 +9,7 @@ import subprocess
 
 
 class JobmonError(Exception):
-    """An actionable error suitable for the command line."""
+    """Actionable CLI error."""
 
 
 ACCOUNTING_DISABLED_GUIDANCE = (
@@ -19,7 +19,6 @@ ACCOUNTING_DISABLED_GUIDANCE = (
 
 
 def accounting_disabled(message):
-    """True when Slurm reports that accounting storage is turned off site-wide."""
     return "accounting storage is disabled" in str(message).lower()
 
 
@@ -78,7 +77,6 @@ def memory_bytes(value, default_unit="M"):
 def requested_memory(value, cpus, nodes):
     match = re.fullmatch(r"(.+?)([cn])?", value or "")
     amount = memory_bytes(match.group(1)) if match else None
-    # An invalid amount cannot establish per-CPU or per-node scope.
     if amount is None:
         return {"bytes": None, "scope": "unavailable", "allocation_bytes": None}
     suffix = match.group(2)
@@ -92,7 +90,7 @@ def parse_rows(output, fields, free_last=False):
     for line in output.splitlines():
         if not line.strip():
             continue
-        # Query job names last so an embedded separator stays in the name.
+        # Keep names last to preserve embedded separators.
         cells = line.split("|", len(fields) - 1) if free_last else line.split("|")
         if not free_last and len(cells) == len(fields) + 1 and cells[-1] == "":
             cells.pop()
@@ -168,7 +166,7 @@ class SlurmBackend:
                     result["errors"].append(str(exc))
         accounting_available = False
         if "sacct" in result["fields"]:
-            # Help/version do not check storage; probe this user's last minute instead.
+            # Probe storage; help/version cannot.
             end = dt.datetime.now()
             start = end - dt.timedelta(minutes=1)
             try:
@@ -200,7 +198,6 @@ class SlurmBackend:
         validate_job_id(job_id)
         if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 3650:
             raise JobmonError("History days must be an integer between 1 and 3650.")
-        # A site without slurmdbd fails every sacct call; report the capability, not the job.
         try:
             return self._accounting(job_id, days)
         except JobmonError as exc:
@@ -256,7 +253,7 @@ class SlurmBackend:
                     continue
                 if row["UID"] not in ("", str(self.uid)) or row["User"] not in ("", self.user):
                     continue
-                # Old Slurm versions may omit step Submit; never merge ambiguous requeues.
+                # Legacy steps lack Submit; reject ambiguous requeues.
                 if len(siblings) > 1:
                     matching = [p for p in siblings if row.get("Submit") and p.get("Submit") == row["Submit"]]
                     if len(matching) != 1 or matching[0] is not parent:

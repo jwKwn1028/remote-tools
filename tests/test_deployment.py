@@ -285,7 +285,6 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(self.wrapper.resolve(), release / "monitored-job.sh")
         self.assertEqual(self.wrapper.stat().st_mode & 0o777, 0o700)
         self.assert_no_staging_left()
-        # A later deployment over SSH recognizes the managed layout and reuses it.
         self.assertEqual(self.install(), release)
 
     def test_local_previews_by_default_and_rejects_a_destination(self):

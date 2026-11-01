@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Invoke after allocation/module setup in your sbatch script:
+# In your sbatch script, after module setup:
 #   bash /path/to/monitored-job.sh srun your-application its-arguments
-# Preserve your workload's existing launcher and resource/binding options.
-# Trap handlers below are invoked indirectly by Bash.
 # shellcheck disable=SC2317
 set -euo pipefail
 
@@ -26,7 +24,7 @@ jobmon_cleaned=0
 declare -a jobmon_signal_pids=()
 declare -A jobmon_signal_starts=()
 
-# Track /proc identities to avoid signaling recycled PIDs; preserve the batch group.
+# Track /proc identities; avoid recycled PIDs and preserve the batch group.
 jobmon_read_process() {
     local pid=$1 info
     local -a fields
@@ -63,9 +61,9 @@ jobmon_cleanup() {
     local application_status=$1 attempts=0
     (( jobmon_cleaned == 0 )) || return 0
     jobmon_cleaned=1
-    # Cleanup interruptions must preserve the workload's final exit status.
+    # Preserve workload status during cleanup interruptions.
     trap '' TERM INT HUP
-    # Every monitoring operation is guarded so failures cannot mask workload status.
+    # Guard monitoring failures to preserve workload status.
     if [[ -n $jobmon_run_dir ]]; then
         "$jobmon_python" "$jobmon_collector" stop --run-dir "$jobmon_run_dir" || true
     fi
@@ -94,12 +92,12 @@ jobmon_signal() {
     local -a pending=() child_pids=()
     local -A children=() starts=()
     trap '' TERM INT HUP
-    # A trap can run between spawning the asynchronous command and saving $!.
+    # A trap may run before $! is saved.
     if [[ -z $jobmon_workload_pid && $jobmon_launching == 1 ]]; then
         jobmon_workload_pid=${!:-}
     fi
     if [[ -n $jobmon_workload_pid ]]; then
-        # Snapshot descendants before signaling parents that could exit and orphan them.
+        # Snapshot descendants before parents exit and orphan them.
         for path in /proc/[0-9]*/stat; do
             pid=${path%/stat}
             pid=${pid##*/}
@@ -120,12 +118,10 @@ jobmon_signal() {
                 pending+=("${child_pids[@]}")
                 jobmon_signal_starts[$pid]=${starts[$pid]}
             done
-            # Leaves first, so parents can reap children during graceful shutdown.
             for (( index = ${#pending[@]} - 1; index >= 0; index-- )); do
                 jobmon_signal_pids+=("${pending[index]}")
             done
         fi
-        # Further interruptions still reach surviving processes while we wait.
         trap 'jobmon_forward_signal TERM' TERM
         trap 'jobmon_forward_signal INT' INT
         trap 'jobmon_forward_signal HUP' HUP
@@ -151,7 +147,7 @@ if jobmon_run_dir=$("$jobmon_python" "$jobmon_collector" init); then
             --interval "${JOBMON_INTERVAL:-60}" &
         jobmon_monitor_pid=$!
     elif [[ ${JOBMON_ALLOW_OVERLAP:-0} == 1 ]]; then
-        # Opt in only after site validation. Overlap may expose a different GPU set.
+        # Overlap may expose a different GPU set.
         srun --overlap --nodes="${SLURM_JOB_NUM_NODES:-$SLURM_NNODES}" \
             --ntasks="${SLURM_JOB_NUM_NODES:-$SLURM_NNODES}" --ntasks-per-node=1 \
             --cpus-per-task=1 --mem=64M \
@@ -167,7 +163,6 @@ else
 fi
 
 if [[ -n $jobmon_monitor_pid ]]; then
-    # Give collectors a bounded opportunity to persist their first sample.
     shopt -s nullglob
     jobmon_ready_attempts=0
     jobmon_expected_nodes=${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}}
@@ -183,8 +178,7 @@ if [[ -n $jobmon_monitor_pid ]]; then
     fi
 fi
 
-# Preserve an input deck, or a caller's deliberately closed fd 0.
-# Bash otherwise redirects asynchronous stdin and ignores SIGINT.
+# Preserve fd 0; Bash redirects asynchronous stdin and ignores SIGINT.
 if { exec {jobmon_input_fd}<&0; } 2>/dev/null; then
     jobmon_launching=1
     (trap - INT QUIT; exec "$@") <&"$jobmon_input_fd" &
