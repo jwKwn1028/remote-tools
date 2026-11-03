@@ -1589,6 +1589,21 @@ class TransportTests(unittest.TestCase):
         self.assertNotIn("Traceback", screen)
         self.assertEqual(requests, [])
 
+    def test_jobs_aligns_columns_on_a_terminal_and_keeps_tsv_in_pipes(self):
+        table = ("JOB ID\tSTATE\tELAPSED\tCPUS\tNODES\tREASON / NODELIST\tJOB NAME\n"
+                 "458788\tRUNNING\t2-01:48:34\t40\t1\tnode28\tbath 30\n"
+                 "461598\tPENDING\t0:16\t40\t1\t(Resources)\tcasci_\n")
+        screen, status, requests = self.pick(table, command="hpc-jobs")
+        self.assertEqual(status, 0, screen)
+        self.assertEqual(requests, [{"operation": "jobs"}])
+        self.assertEqual(screen.splitlines()[:3], [
+            "JOB ID  STATE    ELAPSED     CPUS  NODES  REASON / NODELIST  JOB NAME",
+            "458788  RUNNING  2-01:48:34  40    1      node28             bath 30",
+            "461598  PENDING  0:16        40    1      (Resources)        casci_"])
+        screen, status, _ = self.pick(table, command="hpc-jobs | cat")
+        self.assertEqual(status, 0, screen)
+        self.assertEqual(screen.replace("\r\n", "\n")[:len(table)], table)
+
     def test_live_opens_all_started_jobs_without_a_terminal_picker(self):
         table = self.job_table(("900_2", "PENDING"), ("900_0", "RUNNING", "first simulation"),
                                ("900_1", "COMPLETING", "second simulation"))

@@ -190,7 +190,35 @@ _jobmon_choose_job() {
 
 hpc-jdoctor() { emulate -L zsh; _jobmon_request doctor "$@"; }
 hpc-jstorage-init() { emulate -L zsh; _jobmon_request storage-init "$@"; }
-hpc-jobs() { emulate -L zsh; _jobmon_request jobs "$@"; }
+hpc-jobs() {
+  emulate -L zsh
+  if [[ ! -t 1 || ${@[(I)--json]} -ne 0 ]]; then
+    _jobmon_request jobs "$@"
+    return
+  fi
+  # Tab stops misalign wide fields; pad on the terminal, keep TSV for pipes.
+  local output line row
+  local -a fields widths
+  local -i i rc
+  output=$(_jobmon_request jobs "$@")
+  rc=$?
+  [[ -n $output ]] || return rc
+  for line in "${(@f)output}"; do
+    fields=("${(@ps:\t:)line}")
+    for (( i = 1; i < $#fields; i++ )); do
+      (( ${#fields[i]} > ${widths[i]:-0} )) && widths[i]=${#fields[i]}
+    done
+  done
+  for line in "${(@f)output}"; do
+    fields=("${(@ps:\t:)line}")
+    row=
+    for (( i = 1; i < $#fields; i++ )); do
+      row+=${(r:widths[i]+2:)fields[i]}
+    done
+    print -r -- "$row$fields[-1]"
+  done
+  return rc
+}
 hpc-job() { emulate -L zsh; _jobmon_request show "$@"; }
 hpc-jwatch() {
   emulate -L zsh
